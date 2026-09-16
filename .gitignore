@@ -1,0 +1,8 @@
+__pycache__/
+duifenyi.ini
+
+# 打包产物与构建环境
+build/
+build_env/
+dist/
+*.zip

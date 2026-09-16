@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>对分易自动签到</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <!-- pywebview-drag-region 是无边框窗口的可拖区标记，勿删 -->
+    <header class="topbar pywebview-drag-region">
+      <div class="topbar-left">
+        <span class="logo-dot"></span>
+        <span class="app-title">对分易自动签到</span>
+        <span class="chip chip-version" id="versionChip">v—</span>
+      </div>
+      <div class="topbar-right">
+        <span class="status-pill" id="statusPill">
+          <span class="dot" id="statusDot"></span>
+          <span id="statusText">已停止</span>
+        </span>
+        <button class="icon-btn" id="settingsBtn" title="设置">
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            width="16"
+            height="16"
+          >
+            <circle cx="12" cy="12" r="3"></circle>
+            <path
+              d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"
+            ></path>
+          </svg>
+        </button>
+        <button class="btn btn-danger" id="stopBtn" disabled>
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            width="14"
+            height="14"
+          >
+            <rect x="6" y="6" width="12" height="12" rx="2"></rect>
+          </svg>
+          停止监听
+        </button>
+        <span class="win-btns">
+          <button class="win-btn" id="winMin" title="最小化">
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              width="14"
+              height="14"
+            >
+              <line x1="5" y1="12" x2="19" y2="12"></line>
+            </svg>
+          </button>
+          <button class="win-btn win-close" id="winClose" title="关闭">
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              width="14"
+              height="14"
+            >
+              <line x1="18" y1="6" x2="6" y2="18"></line>
+              <line x1="6" y1="6" x2="18" y2="18"></line>
+            </svg>
+          </button>
+        </span>
+      </div>
+    </header>
+
+    <main class="shell">
+      <aside class="col-left">
+        <section class="panel panel-login">
+          <div class="panel-head">
+            <h2 class="panel-title">登录</h2>
+            <span class="chip chip-login off" id="loginChip">
+              <span class="dot" id="loginDot"></span>
+              <span id="loginText">未登录</span>
+            </span>
+          </div>
+
+          <div class="notice-banner hidden" id="noticeBanner"></div>
+
+          <div class="seg-tabs" id="loginTabs">
+            <button class="chip seg active" data-tab="link">微信链接</button>
+            <button class="chip seg" data-tab="pwd">账号密码</button>
+          </div>
+
+          <div class="tab-pane" id="paneLink">
+            <label class="field-label" for="linkInput">登录链接</label>
+            <input
+              class="input"
+              id="linkInput"
+              type="text"
+              placeholder="粘贴微信回调链接（含 code=...）"
+            />
+            <button class="btn btn-primary btn-block" id="loginLinkBtn">
+              <span class="spinner hidden" id="linkSpinner"></span>
+              <span>登录</span>
+            </button>
+          </div>
+
+          <div class="tab-pane hidden" id="panePwd">
+            <label class="field-label" for="userInput">账号</label>
+            <input
+              class="input"
+              id="userInput"
+              type="text"
+              placeholder="对分易账号"
+            />
+            <label class="field-label" for="passInput">密码</label>
+            <input
+              class="input"
+              id="passInput"
+              type="password"
+              placeholder="密码"
+            />
+            <button class="btn btn-primary btn-block" id="loginPwdBtn">
+              <span class="spinner hidden" id="pwdSpinner"></span>
+              <span>登录</span>
+            </button>
+            <p class="login-hint">账号密码不支持二维码签到</p>
+          </div>
+        </section>
+
+        <section class="panel panel-help">
+          <div class="panel-head">
+            <h2 class="panel-title">微信登录说明</h2>
+          </div>
+          <ol class="help-steps" id="helpSteps"></ol>
+        </section>
+      </aside>
+
+      <section class="col-right">
+        <section class="panel panel-status">
+          <div class="status-field">
+            <label class="status-label" for="courseSelect">监控课程</label>
+            <select class="input select select-sm" id="courseSelect">
+              <option value="">请先登录</option>
+            </select>
+            <button class="btn btn-primary btn-sm" id="startBtn" disabled>
+              <span class="spinner hidden" id="startSpinner"></span>
+              <span>开始监听</span>
+            </button>
+          </div>
+
+          <div class="status-field status-now">
+            <div class="now-item">
+              <span class="status-label">当前监听</span>
+              <span class="now-value" id="monCourse">—</span>
+            </div>
+            <div class="now-item">
+              <span class="status-label">最近轮询</span>
+              <span class="now-value mono" id="lastTick">—</span>
+            </div>
+            <div class="now-item hidden" id="limiterItem">
+              <span class="status-label">限流恢复</span>
+              <span class="now-value mono" id="limiterLeft">—</span>
+            </div>
+            <div class="now-item now-clock">
+              <span class="status-label">时间</span>
+              <span class="now-value mono" id="clockTime">--:--:--</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel panel-log">
+          <div class="log-head">
+            <div class="log-head-left">
+              <h2 class="panel-title">运行日志</h2>
+              <span class="log-count" id="logCount">0 条</span>
+            </div>
+            <div class="log-head-right">
+              <button
+                class="chip toggle active"
+                id="autoScrollBtn"
+                title="自动滚动"
+              >
+                <span class="dot dot-sm"></span>
+                自动滚动
+              </button>
+              <button class="icon-btn" id="clearBtn" title="清空日志">
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  width="16"
+                  height="16"
+                >
+                  <path d="M3 6h18"></path>
+                  <path
+                    d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"
+                  ></path>
+                  <path d="M10 11v6M14 11v6"></path>
+                  <path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"></path>
+                </svg>
+              </button>
+            </div>
+          </div>
+          <div class="log-body" id="logBody">
+            <div class="log-empty" id="logEmpty">
+              <div class="log-empty-title">暂无日志</div>
+              <div class="log-empty-sub">登录并开始监听后将在此显示</div>
+            </div>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <div class="overlay" id="overlay"></div>
+    <aside class="drawer" id="settingsDrawer">
+      <div class="drawer-head">
+        <h2 class="panel-title">设置</h2>
+        <button class="icon-btn" id="settingsClose" title="关闭">
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            width="16"
+            height="16"
+          >
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
+        </button>
+      </div>
+      <div class="drawer-body">
+        <form id="settingsForm" class="settings-form"></form>
+        <div class="settings-actions">
+          <button class="btn btn-default" id="settingsReset" type="button">
+            恢复默认
+          </button>
+          <button class="btn btn-primary" id="settingsSave" type="button">
+            保存设置
+          </button>
+        </div>
+      </div>
+    </aside>
+
+    <!-- 模态：登录态失效等须用户确认的消息（遮罩变暗并拦截点击） -->
+    <div class="modal-mask" id="modalMask" aria-hidden="true">
+      <div
+        class="modal"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="modalTitle"
+        aria-describedby="modalText"
+      >
+        <div class="modal-title" id="modalTitle">提示</div>
+        <div class="modal-text" id="modalText"></div>
+        <div class="modal-actions">
+          <button class="btn btn-primary" id="modalOk" type="button">
+            确定
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

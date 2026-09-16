@@ -1,0 +1,4 @@
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+websocket-client>=1.7.0
+pywebview>=5.0
