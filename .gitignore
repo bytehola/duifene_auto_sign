@@ -6,3 +6,7 @@ build/
 build_env/
 dist/
 *.zip
+
+analysis-session/
+分析数据/
+tests/

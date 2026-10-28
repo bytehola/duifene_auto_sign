@@ -17,20 +17,6 @@
   // 开始/停止请求在途：期间控件保持禁用，避免连点重复提交。
   var runBusy = false;
 
-  // 微信授权链接（复制按钮与说明步骤共用；此处为原始文本，& 不做 HTML 转义）
-  var WECHAT_LINK =
-    "https://open.weixin.qq.com/connect/oauth2/authorize?appid=wx1b5650884f657981&redirect_uri=https://www.duifene.com/_FileManage/PdfView.aspx?file=https%3A%2F%2Ffs.duifene.com%2Fres%2Fr2%2Fu6106199%2F%E5%AF%B9%E5%88%86%E6%98%93%E7%99%BB%E5%BD%95_876c9d439ca68ead389c.pdf&response_type=code&scope=snsapi_userinfo&connect_redirect=1#wechat_redirect";
-
-  // 说明步骤：字符串为普通文案；{link:true} 处渲染「链接 + 复制按钮」。
-  // 注意：不能用 ``step.link`` 判断——字符串经原型链装箱会命中已废弃的
-  // String.prototype.link 方法（返回函数，truthy），导致所有文本步骤都被误判。
-  var WECHAT_HELP = [
-    "打开电脑端微信，复制如下链接到文件传输助手并发送：",
-    { isLink: true },
-    "点击进入链接，点击微信浏览器窗口右上角三个点，点击复制链接。",
-    "把微信链接粘贴到左侧「登录链接」输入框，点击登录。",
-  ];
-
   var $ = function (id) {
     return document.getElementById(id);
   };
@@ -49,12 +35,6 @@
         {
           key: "poll_max_s",
           label: "轮询最大间隔",
-          hint: "秒",
-          type: "number",
-        },
-        {
-          key: "login_check_interval_s",
-          label: "登录态检查间隔",
           hint: "秒",
           type: "number",
         },
@@ -108,23 +88,6 @@
           key: "stale_sign_minutes",
           label: "旧活动上限",
           hint: "分钟，超过则跳过",
-          type: "number",
-        },
-      ],
-    },
-    {
-      title: "定位与推送",
-      fields: [
-        {
-          key: "ws_follow_distance_m",
-          label: "推送跟随距离",
-          hint: "米，超过则不跟随",
-          type: "number",
-        },
-        {
-          key: "ws_wait_timeout_s",
-          label: "推送等待上限",
-          hint: "秒",
           type: "number",
         },
       ],
@@ -279,6 +242,15 @@
     $("loginText").textContent = loggedIn ? "已登录" : "未登录";
   }
 
+  function setSessionIdentity(account, userId, loggedIn) {
+    var bar = $("identityBar");
+    if (!bar) return;
+    var visible = !!loggedIn && !!(account || userId);
+    bar.classList.toggle("hidden", !visible);
+    $("identityAccount").textContent = account || "—";
+    $("identityId").textContent = userId || "—";
+  }
+
   function applyState(st) {
     var pill = $("statusPill");
     var running = !!(st && st.running);
@@ -308,6 +280,11 @@
       // （如 applyState({running:true})）不含该字段，不可据此改状态位。
       if (typeof st.logged_in === "boolean") {
         setLoginChip(st.logged_in);
+        setSessionIdentity(
+          st.user_account || "",
+          st.user_id || "",
+          st.logged_in,
+        );
         // 后台探测到会话失效时，后端已清空当前课程；此处同步复位课程
         // 选择器，否则会留着失效课程的旧选项且「开始监听」仍可点。
         if (!st.logged_in && $("courseSelect").value) {
@@ -378,6 +355,17 @@
       document.title = "对分易自动签到 v" + res.version;
       fillCourses(res.courses, res.selected);
       setLoginChip(res.logged_in);
+      setSessionIdentity(
+        res.user_account || "",
+        res.user_id || "",
+        res.logged_in,
+      );
+      if (res.saved_account) {
+        $("userInput").value = res.saved_account;
+      }
+      if (res.saved_password) {
+        $("passInput").value = res.saved_password;
+      }
       if (res.logs && res.logs.length) {
         logCursor = res.logs[res.logs.length - 1].id;
         appendLogs(res.logs);
@@ -395,71 +383,8 @@
   }
 
   // ─ 事件绑定 ────────────────────────────────────────────
-  // 登录页签高度取两者较高者，使「微信链接 / 账号密码」切换时面板尺寸不变。
-  // 用 min-height 而非叠层或写死像素：页签仍按 display 正常切换、互不重叠，
-  // 故不会在 WebView2 合成层留下残影；高度又不会随页签长短跳动。
-  function lockTabPaneHeight() {
-    var link = $("paneLink"),
-      pwd = $("panePwd");
-    if (!link || !pwd) return;
-    var linkHidden = link.classList.contains("hidden"),
-      pwdHidden = pwd.classList.contains("hidden");
-    // 量高度需元素可见：先临时显示，量完还原。
-    link.classList.remove("hidden");
-    pwd.classList.remove("hidden");
-    // 用 boundingRect 并向上取整：offsetHeight 会取整到整数，与亚像素布局
-    // 叠加后可能比另一个页签少 1px，导致切换时高度抖动。
-    var tallest = Math.ceil(
-      Math.max(
-        link.getBoundingClientRect().height,
-        pwd.getBoundingClientRect().height,
-      ),
-    );
-    if (linkHidden) link.classList.add("hidden");
-    if (pwdHidden) pwd.classList.add("hidden");
-    link.style.minHeight = tallest + "px";
-    pwd.style.minHeight = tallest + "px";
-  }
-
   function bind() {
-    // 分段选项卡
-    $("loginTabs").addEventListener("click", function (e) {
-      var btn = e.target.closest(".seg");
-      if (!btn) return;
-      Array.prototype.forEach.call(
-        document.querySelectorAll(".seg"),
-        function (b) {
-          b.classList.toggle("active", b === btn);
-        },
-      );
-      var isLink = btn.dataset.tab === "link";
-      $("paneLink").classList.toggle("hidden", !isLink);
-      $("panePwd").classList.toggle("hidden", isLink);
-    });
-
-    // 链接登录
-    $("loginLinkBtn").addEventListener("click", function () {
-      var val = $("linkInput").value.trim();
-      if (val.indexOf("code=") === -1) {
-        markInvalid($("linkInput"));
-        toast("链接有误", "error");
-        return;
-      }
-      setLoading("loginLinkBtn", "linkSpinner", true);
-      api.login_by_link(val).then(function (r) {
-        setLoading("loginLinkBtn", "linkSpinner", false);
-        notifyResult(r);
-        if (r.ok) {
-          resetLogsAfterLogin(r.next_id);
-          api.bootstrap().then(function (b) {
-            fillCourses(b.courses, b.selected);
-            setLoginChip(b.logged_in);
-          });
-        }
-      });
-    });
-
-    // 密码登录
+    // 账号密码登录
     $("loginPwdBtn").addEventListener("click", function () {
       var u = $("userInput").value.trim();
       if (!u) {
@@ -572,82 +497,6 @@
     $("settingsReset").addEventListener("click", function () {
       renderSettings(settingsDefaults);
       toast("已填入默认值，点击保存生效");
-    });
-  }
-
-  // 复制文本：优先 Clipboard API（WebView2 下 file:// 属可信来源可用），
-  // 失败则回退到 execCommand 兼容路径。
-  function copyText(text) {
-    var fallback = function () {
-      var ta = document.createElement("textarea");
-      ta.value = text;
-      ta.setAttribute("readonly", "");
-      ta.style.position = "fixed";
-      ta.style.top = "-1000px";
-      ta.style.opacity = "0";
-      document.body.appendChild(ta);
-      ta.select();
-      var ok = false;
-      try {
-        ok = document.execCommand("copy");
-      } catch (e) {
-        ok = false;
-      }
-      document.body.removeChild(ta);
-      return ok;
-    };
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      return navigator.clipboard.writeText(text).then(
-        function () {
-          return true;
-        },
-        function () {
-          return fallback();
-        },
-      );
-    }
-    return Promise.resolve(fallback());
-  }
-
-  function copyWechatLink() {
-    copyText(WECHAT_LINK).then(function (ok) {
-      toast(
-        ok ? "链接已复制" : "复制失败，请手动选取",
-        ok ? "success" : "error",
-      );
-    });
-  }
-
-  // 填充帮助步骤
-  function renderHelp() {
-    var ol = $("helpSteps");
-    ol.innerHTML = "";
-    var lastLi = null;
-    WECHAT_HELP.forEach(function (step) {
-      // 链接行不单独占一个列表项：否则 <ol> 会自动编号，出现「2.」并导致后续断号。
-      // 把它并入上一条步骤的 li 内，编号仍为 1 / 2 / 3。
-      if (step && typeof step === "object" && step.isLink) {
-        if (!lastLi) return;
-        var row = document.createElement("div");
-        row.className = "help-link-row";
-        var code = document.createElement("code");
-        code.className = "help-link";
-        code.textContent = WECHAT_LINK;
-        code.title = WECHAT_LINK;
-        var btn = document.createElement("button");
-        btn.type = "button";
-        btn.className = "btn btn-primary btn-sm help-copy-btn";
-        btn.textContent = "复制链接";
-        btn.addEventListener("click", copyWechatLink);
-        row.appendChild(code);
-        row.appendChild(btn);
-        lastLi.appendChild(row);
-        return;
-      }
-      var li = document.createElement("li");
-      li.textContent = step;
-      ol.appendChild(li);
-      lastLi = li;
     });
   }
 
@@ -774,10 +623,8 @@
   // 等待 pywebview 注入 js_api
   window.addEventListener("pywebviewready", function () {
     api = window.pywebview.api;
-    renderHelp();
     buildSettingsForm();
     bind();
-    lockTabPaneHeight();
     tickClock();
     clockTimer = setInterval(tickClock, 1000);
     bootstrap();

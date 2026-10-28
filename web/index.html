@@ -96,26 +96,14 @@
 
           <div class="notice-banner hidden" id="noticeBanner"></div>
 
-          <div class="seg-tabs" id="loginTabs">
-            <button class="chip seg active" data-tab="link">微信链接</button>
-            <button class="chip seg" data-tab="pwd">账号密码</button>
+          <div class="identity-bar hidden" id="identityBar">
+            <span class="identity-label">账号</span>
+            <span class="identity-account" id="identityAccount">—</span>
+            <span class="identity-label identity-id-label">ID</span>
+            <span class="identity-id" id="identityId">—</span>
           </div>
 
-          <div class="tab-pane" id="paneLink">
-            <label class="field-label" for="linkInput">登录链接</label>
-            <input
-              class="input"
-              id="linkInput"
-              type="text"
-              placeholder="粘贴微信回调链接（含 code=...）"
-            />
-            <button class="btn btn-primary btn-block" id="loginLinkBtn">
-              <span class="spinner hidden" id="linkSpinner"></span>
-              <span>登录</span>
-            </button>
-          </div>
-
-          <div class="tab-pane hidden" id="panePwd">
+          <div class="tab-pane" id="panePwd">
             <label class="field-label" for="userInput">账号</label>
             <input
               class="input"
@@ -134,15 +122,19 @@
               <span class="spinner hidden" id="pwdSpinner"></span>
               <span>登录</span>
             </button>
-            <p class="login-hint">账号密码不支持二维码签到</p>
           </div>
         </section>
 
         <section class="panel panel-help">
           <div class="panel-head">
-            <h2 class="panel-title">微信登录说明</h2>
+            <h2 class="panel-title">免责声明</h2>
           </div>
-          <ol class="help-steps" id="helpSteps"></ol>
+          <ol class="help-steps">
+            <li>账号和密码默认保存在本机配置文件中。</li>
+            <li>本工具仅供个人学习与技术研究使用。</li>
+            <li>请确认使用方式符合学校及平台规定。</li>
+            <li>使用本工具产生的后果由使用者自行承担。</li>
+          </ol>
         </section>
       </aside>
 

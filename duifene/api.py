@@ -1,336 +1,119 @@
-"""对分易 HTTP 接口封装（外部 I/O）。"""
+"""对分易 App 接口门面。
+
+业务层只依赖本类；登录、课程、签到数据和提交均转发到 :class:`DfAppApi`。
+"""
 
 from __future__ import annotations
 
-import random
-import re
-from typing import Any
-
 import requests
-from bs4 import BeautifulSoup
 
-from .errors import AuthError, RateLimited
-from .models import CheckInActivity, Course
+from .app_api import AppCheckIn, AppIdentity, DfAppApi
+from .config import IniStore
+from .errors import RateLimited
+from .models import Course
 from .rate_limit import RateLimiter
 from .settings import Settings
 
-FORM_HEADERS = {"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"}
-STUDENT_REFERER = (
-    "https://www.duifene.com/_CheckIn/MB/CheckInStudent.aspx?moduleid=16&pasd="
-)
-DISTANCE_RE = re.compile(r"距离[:：]\s*([0-9]+(?:\.[0-9]+)?)\s*米")
-
 
 class DuifeneApi:
-    """持有注入的 `requests.Session`，负责所有网络往返与响应解析。
-
-    签到类请求统一经 :meth:`_sign_post` 以施加限流约束。
-    """
+    """持有共享 HTTP 会话，向上层提供 App 接口能力。"""
 
     def __init__(
         self,
         session: requests.Session,
         settings: Settings,
         limiter: RateLimiter,
+        session_store: IniStore | None = None,
     ) -> None:
-        self._session = session
         self._settings = settings
         self._limiter = limiter
-        self._user_id: str | None = None
+        self._app_api = DfAppApi(session, settings, session_store)
 
     @property
-    def proxies(self) -> dict[str, str] | None:
-        """底层会话使用的代理配置（供 WebSocket 复用）。"""
-        return self._session.proxies or None
+    def app_authenticated(self) -> bool:
+        """当前是否持有完整 App 登录态。"""
+        return self._app_api.is_authenticated
 
     @property
-    def verify(self) -> bool:
-        """底层会话的 TLS 校验开关（供 WebSocket 复用）。"""
-        return bool(self._session.verify)
-
-    @property
-    def cached_user_id(self) -> str | None:
-        """已缓存的学生 ID；未取过则为 None（不触发网络）。"""
-        return self._user_id
+    def identity(self) -> AppIdentity | None:
+        """当前 App 登录用户。"""
+        return self._app_api.identity
 
     @property
     def limiter(self) -> RateLimiter:
-        """限流状态机。"""
+        """签到限流状态机。"""
         return self._limiter
 
-    def _url(self, path: str) -> str:
-        """拼接完整 URL。"""
-        return self._settings.host + path
-
     def clear_session(self) -> None:
-        """清空 Cookie 并作废缓存的学生 ID。"""
-        self._session.cookies.clear()
-        self._user_id = None
+        """清空 App 登录态。"""
+        self._app_api.clear()
 
-    def login_by_link(self, link_code: str) -> requests.Response:
-        """用微信回调 code 登录；新 Cookie 由 Set-Cookie 落到 session 的 cookie jar。"""
-        self.clear_session()
-        return self._session.get(
-            self._url(f"/P.aspx?authtype=1&code={link_code}&state=1"), timeout=10
-        )
+    def ensure_session_fresh(self, force: bool = False) -> bool:
+        """保持 App 登录状态有效；返回本轮是否执行了刷新。"""
+        return self._app_api.ensure_session_fresh(force=force)
 
     def login_by_password(self, username: str, password: str) -> str:
-        """用账号密码登录；返回服务端 msgbox 文案，请求失败返回空串。"""
-        headers = {**FORM_HEADERS, "Referer": f"{self._settings.host}/AppGate.aspx"}
-        payload = f"action=loginmb&loginname={username}&password={password}"
-        self.clear_session()
-        self._session.get(self._settings.host, timeout=10)
-        response = self._session.post(
-            self._url("/AppCode/LoginInfo.ashx"),
-            data=payload,
-            headers=headers,
-            timeout=self._settings.request_timeout_s,
+        """使用账号密码登录 App 接口。"""
+        if self._app_api.login(username, password):
+            return "登录成功"
+        return "登录失败，请检查账号、密码、网络或代理设置"
+
+    def fetch_courses(self) -> list[Course]:
+        """读取 App 接口中的课程与教学班。"""
+        return self._app_api.fetch_courses()
+
+    def fetch_user_profile(self) -> tuple[str, str] | None:
+        """返回当前账号与用户 ID。"""
+        identity = self.identity
+        if identity is None:
+            return None
+        return identity.account, identity.user_id
+
+    def fetch_active_activity(self, course_id: str) -> AppCheckIn | None:
+        """读取课程当前签到。"""
+        return self._app_api.fetch_active_checkin(course_id)
+
+    def fetch_checkin(self, activity_id: str) -> AppCheckIn | None:
+        """读取指定签到详情。"""
+        return self._app_api.fetch_checkin(activity_id)
+
+    def fetch_headcount(self, activity_id: str) -> tuple[int, int]:
+        """读取签到人数 ``(已参与, 总人数)``。"""
+        return self._app_api.fetch_headcount(activity_id)
+
+    def fetch_room_coordinates(
+        self,
+        activity: AppCheckIn,
+    ) -> tuple[float, float] | None:
+        """读取签到绑定教室的坐标。"""
+        room_id = activity.room_id
+        if not room_id or room_id == "0":
+            detail = self.fetch_checkin(activity.activity_id)
+            room_id = detail.room_id if detail is not None else ""
+        if not room_id or room_id == "0":
+            return None
+        return self._app_api.fetch_room_coordinates(room_id)
+
+    def sign_by_code(self, code: str) -> str:
+        """提交签到码或汉字答案。"""
+        return self._guard_rate_limit(self._app_api.sign_by_code(code))
+
+    def sign_by_qr(self, token: str) -> str:
+        """提交二维码令牌。"""
+        return self._guard_rate_limit(self._app_api.sign_by_qr(token))
+
+    def sign_by_location(self, longitude: float, latitude: float) -> str:
+        """提交定位签到坐标。"""
+        return self._guard_rate_limit(
+            self._app_api.sign_by_location(longitude, latitude)
         )
-        if response.status_code != 200:
-            return ""
-        return response.json().get("msgbox", "")
 
-    def fetch_courses(self) -> list[dict[str, Any]]:
-        """拉取学生课程列表；请求失败返回空列表。
-
-        Raises:
-            AuthError: 接口以 msgbox 形式返回错误（通常为登录失效）。
-        """
-        headers = {
-            **FORM_HEADERS,
-            "Referer": f"{self._settings.host}/_UserCenter/PC/CenterStudent.aspx",
-        }
-        response = self._session.post(
-            self._url("/_UserCenter/CourseInfo.ashx"),
-            data="action=getstudentcourse&classtypeid=2",
-            headers=headers,
-            timeout=self._settings.request_timeout_s,
-        )
-        if response.status_code != 200:
-            return []
-        data = response.json()
-        if isinstance(data, list):
-            return data
-        message = (
-            data.get("msgbox", "登录失效") if isinstance(data, dict) else "登录失效"
-        )
-        raise AuthError(message)
-
-    def check_login(self) -> bool | None:
-        """检查登录态：True 已登录 / False 已失效 / None 网络失败（无法判定）。"""
-        headers = {
-            **FORM_HEADERS,
-            "Referer": f"{self._settings.host}/_UserCenter/PC/CenterStudent.aspx",
-        }
-        response = self._session.get(
-            self._url("/AppCode/LoginInfo.ashx"),
-            data="Action=checklogin",
-            headers=headers,
-            timeout=self._settings.request_timeout_s,
-        )
-        if response.status_code != 200:
-            return None
-        return response.json().get("msg") == "1"
-
-    def fetch_user_id(self) -> str | None:
-        """获取并缓存学生 ID（会话内不变，取到后复用）。"""
-        if self._user_id:
-            return self._user_id
-        response = self._session.get(
-            self._url("/_UserCenter/MB/index.aspx"),
-            timeout=self._settings.request_timeout_s,
-        )
-        if response.status_code != 200:
-            return None
-        element = BeautifulSoup(response.text, "html.parser").find(id="hidUID")
-        if element is not None:
-            self._user_id = element.get("value")
-        return self._user_id
-
-    def _require_user_id(self) -> str:
-        """取学生 ID，取不到即抛错，绝不允许 ``None`` 拼入签到参数。
-
-        轮询每轮开头已确认过 ID，这里防的是轮次中途会话被清理（登录失效
-        竞态）后的空参数提交：``sid=None`` 会被服务端当作非法请求，返回
-        文案还会被 ``_report`` 误判为普通失败。
-
-        Raises:
-            AuthError: 无法获取学生 ID，需重新登录。
-        """
-        user_id = self.fetch_user_id()
-        if not user_id:
-            raise AuthError("无法获取学生 ID，请重新登录")
-        return user_id
-
-    def fetch_activities(
-        self, class_id: str, user_id: str
-    ) -> list[CheckInActivity] | None:
-        """拉取当日签到活动列表；接口异常返回 None。"""
-        headers = {
-            **FORM_HEADERS,
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": f"{self._settings.host}/_CheckIn/PC/StudentNoCheckCount.aspx",
-        }
-        response = self._session.post(
-            self._url("/_CheckIn/MBCount.ashx"),
-            data={
-                "action": "getstudentinlogbyday",
-                "classid": class_id,
-                "studentid": user_id,
-            },
-            headers=headers,
-            timeout=self._settings.request_timeout_s,
-        )
-        if response.status_code != 200:
-            return None
-        data = response.json()
-        if data.get("msg") != "1":
-            return None
-        return [CheckInActivity.from_raw(row) for row in data.get("rows", [])]
-
-    def fetch_headcount(self, check_in_id: str) -> tuple[int, int] | None:
-        """查询签到人数 `(已签到, 总人数)`；失败返回 None。
-
-        已签到 = 总数 − 缺勤（迟到、请假亦视为已参与）。
-        """
-        headers = {
-            **FORM_HEADERS,
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": f"{self._settings.host}/_CheckIn/PC/StudentNoCheckCount.aspx",
-        }
-        try:
-            response = self._session.post(
-                self._url("/_CheckIn/MBCount.ashx"),
-                data={
-                    "action": "getcheckintotalbyciid",
-                    "ciid": check_in_id,
-                    "t": "cking",
-                },
-                headers=headers,
-                timeout=self._settings.request_timeout_s,
-            )
-            if response.status_code != 200:
-                return None
-            data = response.json()
-            total = int(data.get("TotalNumber", 0))
-            absence = int(data.get("AbsenceNumber", total))
-            return max(total - absence, 0), total
-        except (
-            requests.exceptions.RequestException,
-            TypeError,
-            ValueError,
-            AttributeError,
-        ):
-            return None
-
-    def fetch_hanzi_answer(self, course: Course) -> str | None:
-        """读取当前汉字签到的答案。
-
-        Returns:
-            按正确顺序排列的 4 个汉字；非汉字签到、无进行中活动或异常返回 None。
-        """
-        headers = {
-            **FORM_HEADERS,
-            "Referer": f"{self._settings.host}/_CheckIn/PC/TeachCheckInList.aspx",
-        }
-        try:
-            response = self._session.post(
-                self._url("/_CheckIn/PC/TeachCheckIn.aspx"),
-                data={"courseid": course.course_id, "moduleid": "7", "classtype": "1"},
-                headers=headers,
-                timeout=self._settings.request_timeout_s,
-            )
-        except requests.exceptions.RequestException:
-            return None
-        if response.status_code != 200:
-            return None
-        soup = BeautifulSoup(response.text, "html.parser")
-        kind = soup.find(id="HFChecktype")
-        key = soup.find(id="HFCheckCodeKey")
-        if kind is None or key is None or kind.get("value") != "4":
-            return None
-        answer = (key.get("value") or "").strip()
-        return answer or None
-
-    def _sign_post(
-        self, path: str, payload: str, timeout: float | None = None
-    ) -> requests.Response:
-        """发起签到类请求并施加限流约束。
-
-        Raises:
-            RateLimited: 处于静默期（不发送请求），或响应命中限流关键字
-                （此时已进入静默）。
-        """
-        self._limiter.raise_if_blocking()
-        response = self._session.post(
-            self._url(path),
-            data=payload,
-            headers={**FORM_HEADERS, "Referer": STUDENT_REFERER},
-            timeout=timeout or self._settings.request_timeout_s,
-        )
-        if self._limiter.is_limit_text(response.text):
+    def _guard_rate_limit(self, message: str) -> str:
+        """把 App 服务端的限流文案同步到本地静默状态。"""
+        if self._limiter.is_limit_text(message):
             self._limiter.trip()
             raise RateLimited(
                 f"服务端提示签到过于频繁，已静默 "
                 f"{int(self._settings.cooldown_seconds)} 秒"
             )
-        return response
-
-    def sign_by_code(self, code: str) -> str | None:
-        """提交 4 位签到码；异常见 :meth:`_sign_post` 与 :meth:`_require_user_id`。"""
-        user_id = self._require_user_id()
-        response = self._sign_post(
-            "/_CheckIn/CheckIn.ashx",
-            f"action=studentcheckin&studentid={user_id}&checkincode={code}",
-        )
-        if response.status_code != 200:
-            return None
-        return response.json().get("msgbox", "")
-
-    def sign_by_qr(self, state: str) -> str:
-        """以活动 ID 作为 state 完成二维码签到。
-
-        二维码签到仅对微信授权登录的会话有效；账号密码登录调用时服务端返回
-        语义含糊的「参数错误」，此处替换为准确提示。
-        """
-        response = self._session.get(
-            self._url(f"/_CheckIn/MB/QrCodeCheckOK.aspx?state={state}"),
-            timeout=self._settings.request_timeout_s,
-        )
-        if response.status_code != 200:
-            return "二维码签到请求失败"
-        element = BeautifulSoup(response.text, "html.parser").find(id="DivOK")
-        text = element.get_text().strip() if element is not None else ""
-        if text == "参数错误,请重新尝试":
-            return "非微信链接登录，二维码无法签到"
-        return text
-
-    def sign_by_location(self, longitude: float, latitude: float) -> str | None:
-        """定位签到：坐标做微小抖动后提交；异常见 :meth:`_sign_post`。"""
-        jitter = self._settings.location_jitter_deg
-        lon = round(longitude + random.uniform(-jitter, jitter), 8)
-        lat = round(latitude + random.uniform(-jitter, jitter), 8)
-        response = self._sign_post(
-            "/_CheckIn/CheckInRoomHandler.ashx",
-            f"action=signin&sid={self._require_user_id()}&longitude={lon}&latitude={lat}",
-            timeout=15,
-        )
-        if response.status_code != 200:
-            return None
-        return response.json().get("msgbox", "")
-
-    def probe_distance(
-        self, course: Course, longitude: float, latitude: float
-    ) -> float | None:
-        """距离预言机：测该坐标到教室的距离；None 表示该点落在签到范围内
-        （本次探测已真实签到）。RateLimited 时调用方应中止探测。"""
-        response = self._sign_post(
-            "/_CheckIn/CheckInRoomHandler.ashx",
-            f"action=signin&cid={course.course_id}&tcid={course.class_id}"
-            f"&sid={self._require_user_id()}&longitude={longitude}&latitude={latitude}",
-            timeout=15,
-        )
-        if response.status_code != 200:
-            return None
-        match = DISTANCE_RE.search(response.text)
-        return float(match.group(1)) if match else None
+        return message
