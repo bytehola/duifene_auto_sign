@@ -5,14 +5,18 @@ from __future__ import annotations
 import os
 import sys
 
-import webview
-
 from duifene import __version__
 from duifene.bridge import Bridge
 from duifene.settings import Settings
 
 # 窗口与加载覆盖层共用的底色，保证揭幕时无跳色。
 _BACKGROUND = "#f7f9f9"
+_PYTHONNET_RUNTIME_RELATIVE_PATH = (
+    "_internal",
+    "pythonnet",
+    "runtime",
+    "Python.Runtime.dll",
+)
 
 
 def resource_path(*parts: str) -> str:
@@ -22,6 +26,30 @@ def resource_path(*parts: str) -> str:
     """
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, *parts)
+
+
+def _unblock_pythonnet_runtime(root: str | os.PathLike[str] | None = None) -> bool:
+    """移除 Python.Runtime.dll 的 Windows 网络来源标记。
+
+    .NET Framework 会拒绝加载带 ``Zone.Identifier`` 的托管程序集。
+    仅处理 pythonnet 明确需要的运行时 DLL，保留其他文件的来源标记。
+    """
+    if sys.platform != "win32":
+        return False
+    if root is None:
+        if not getattr(sys, "frozen", False):
+            return False
+        root = os.path.dirname(os.path.abspath(sys.executable))
+    runtime_path = os.path.join(os.fspath(root), *_PYTHONNET_RUNTIME_RELATIVE_PATH)
+    if not os.path.isfile(runtime_path):
+        return False
+    try:
+        os.remove(f"{runtime_path}:Zone.Identifier")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    return True
 
 
 # WebView2 运行时在注册表中的四个安装通道（正式版 / Beta / Dev / Canary）
@@ -134,6 +162,9 @@ def _install_loading_overlay(window: webview.Window) -> None:
 
 def main() -> None:
     """创建窗口并进入 pywebview 事件循环。"""
+    _unblock_pythonnet_runtime()
+    import webview
+
     if not _has_webview2():
         _warn_missing_webview2()
         return
