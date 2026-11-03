@@ -10,6 +10,7 @@ from .errors import LogFn, RateLimited
 from .location import LocationResolver
 from .models import CheckInActivity, Course, Outcome
 from .push import PushMonitor
+from .qrdecode import QrDecodeUnavailable
 from .settings import Settings
 
 
@@ -41,6 +42,11 @@ class ActivityProcessor:
         # 已出过结果的活动：签到失败不进 ``_handled``，活动会每轮重试；此集合
         # 作为静音开关，令同活动的提交与结果文案只在首轮输出，避免逐轮刷屏。
         self._result_logged: set[str] = set()
+        # 二维码同活动的上次提交时刻：被拒后的重试保持最小间隔，不逐轮硬打。
+        self._qr_attempt_at: dict[str, float] = {}
+        # 二维码连续取不到图片的轮次计数（按活动）：达到上限判定活动已结束。
+        self._qr_no_image: dict[str, int] = {}
+        self._qr_deps_warned = False
 
     def reset(self) -> None:
         """清空跨轮次状态。"""
@@ -48,6 +54,9 @@ class ActivityProcessor:
         self._headcount_log.clear()
         self._wait_start.clear()
         self._result_logged.clear()
+        self._qr_attempt_at.clear()
+        self._qr_no_image.clear()
+        self._qr_deps_warned = False
 
     def _log_attempt(self, activity_id: str, course: Course, message: str) -> None:
         """输出签到尝试文案；该活动已出过结果时静默。"""
@@ -173,9 +182,69 @@ class ActivityProcessor:
         return self._report(activity.id, self._api.sign_by_code(activity.code), course)
 
     def _sign_qr(self, activity: CheckInActivity, course: Course) -> Outcome:
-        """二维码签到。"""
-        self._log_attempt(activity.id, course, f"活动 {activity.id} 提交二维码签到")
-        return self._report(activity.id, self._api.sign_by_qr(activity.id), course)
+        """二维码签到：活动 ID 直签，被拒后取实时二维码解码滚动令牌重试。
+
+        服务端的「参数错误」同时表达「会话非微信授权」与「令牌已过期」；
+        二维码令牌随刷新周期轮换，直签被拒时唯一可靠的补救是拉取当前二维码
+        图并解码出在用令牌。同一活动两次提交间保持最小间隔，避免被高频拒绝。
+        """
+        aid = activity.id
+        now = time.monotonic()
+        if now - self._qr_attempt_at.get(aid, 0.0) < self._settings.qr_retry_interval_s:
+            return Outcome.DEFERRED
+        self._qr_attempt_at[aid] = now
+
+        self._log_attempt(aid, course, f"活动 {aid} 提交二维码签到")
+        message = self._api.sign_by_qr(aid, course.course_id)
+        if self._is_signed(message):
+            return self._report(aid, message, course)
+        if not self._is_qr_rejected(message):
+            return self._report(aid, message, course)
+
+        image = self._api.fetch_qr_image(course.course_id)
+        if image is not None and image:
+            self._qr_no_image[aid] = 0
+        else:
+            misses = self._qr_no_image.get(aid, 0) + 1
+            self._qr_no_image[aid] = misses
+            if misses >= self._settings.qr_no_image_max:
+                # 连续多轮拿不到二维码：活动大概率已结束，停止重试。
+                self._handled.add(aid)
+                return self._report(aid, "始终未取得二维码数据（活动可能已结束）", course)
+            return Outcome.DEFERRED
+        try:
+            state = self._api.resolve_qr_state(image)
+        except QrDecodeUnavailable:
+            self._warn_qr_deps(course)
+            return self._report(aid, "缺少解码组件，无法获取实时二维码令牌", course)
+        if not state:
+            return self._report(aid, "未能从实时二维码解析出签到令牌", course)
+        if state == str(aid):
+            return self._report(aid, message, course)  # 同一令牌刚被拒，不重复提交
+        message = self._api.sign_by_qr(state, course.course_id)
+        if not self._is_signed(message) and self._is_qr_rejected(message):
+            message = "二维码签到被拒（需微信链接登录，且签到须仍在进行中）"
+        return self._report(aid, message, course)
+
+    @staticmethod
+    def _is_qr_rejected(message: str | None) -> bool:
+        """服务端是否以「参数错误」拒绝了本次二维码提交（可尝试解码回退）。
+
+        空文案（无 DivOK / 非 200）同样视为被拒：可能是会话缺入口或令牌无效，
+        均值得走一次实时二维码回退。
+        """
+        return not message or "参数错误" in message
+
+    def _warn_qr_deps(self, course: Course) -> None:
+        """缺解码依赖时全局提示一次，不随活动逐轮刷屏。"""
+        if self._qr_deps_warned:
+            return
+        self._qr_deps_warned = True
+        self._log_course(
+            course,
+            "缺少 Pillow/pyzbar，无法解码实时二维码；"
+            "请执行 pip install pyzbar pillow 后重启程序",
+        )
 
     def _sign_hanzi(self, activity: CheckInActivity, course: Course) -> Outcome:
         """汉字签到：取正确顺序后按序提交。"""
@@ -255,14 +324,32 @@ class ActivityProcessor:
         """服务端文案是否表示签到成功。"""
         return bool(message) and "签到成功" in message and "未成功" not in message
 
+    @staticmethod
+    def _is_attended(message: str | None) -> bool:
+        """服务端文案是否表示名单里已有此人（重复提交类回执）。
+
+        二维码活动新旧两条记录并存时，新活动签成后旧活动仍每轮提交，服务端
+        返回「已签到/重复」类文案；这实为出勤，按成功收尾而非每轮报失败。
+        """
+        if not message or "未" in message:
+            return False
+        return "已签到" in message or ("重复" in message and "签到" in message)
+
     def _report(self, activity_id: str, message: str | None, course: Course) -> Outcome:
         """输出签到结果并归一化：把五花八门的服务端文案统一成
         「签到成功 / 签到失败：原因」一行，借关键字着色（成功→绿、失败→红）。
 
-        结果只记一次——失败不进 ``_handled`` 会每轮重试。
+        结果只记一次——失败不进 ``_handled`` 会每轮重试。但失败后的重试若
+        终于成功，成功文案必须覆盖此前已记录的失败（先解除静音再记录），
+        不能让用户只见失败不见成功。
         """
         if self._is_signed(message):
+            self._result_logged.discard(activity_id)
             self._log_result(activity_id, course, "签到成功")
+            return Outcome.SIGNED
+        if self._is_attended(message):
+            self._result_logged.discard(activity_id)
+            self._log_result(activity_id, course, "已在签到名单（服务端提示已签到）")
             return Outcome.SIGNED
         self._log_result(activity_id, course, f"签到失败：{message or '无响应'}")
         return Outcome.SKIPPED

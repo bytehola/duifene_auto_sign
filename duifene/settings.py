@@ -146,6 +146,10 @@ class Settings:
     # 限流
     cooldown_seconds: float = 300.0
     rate_limit_markers: tuple[str, ...] = ("过于频繁", "频繁")
+    # 二维码：同一活动两次提交的最小间隔（直签被拒后的重试节流）
+    qr_retry_interval_s: float = 6.0
+    # 二维码：连续取不到图片的最大轮次，超过即判定活动已结束
+    qr_no_image_max: int = 8
     # WebSocket 跟随
     ws_follow_distance_m: float = 50.0
     ws_wait_timeout_s: float = 15.0

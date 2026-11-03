@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import base64
 import random
 import re
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
 from .errors import AuthError, RateLimited
 from .models import CheckInActivity, Course
+from .qrdecode import decode_payload
 from .rate_limit import RateLimiter
 from .settings import Settings
 
@@ -287,23 +290,112 @@ class DuifeneApi:
             return None
         return response.json().get("msgbox", "")
 
-    def sign_by_qr(self, state: str) -> str:
-        """以活动 ID 作为 state 完成二维码签到。
+    def sign_by_qr(self, state: str, course_id: str | None = None) -> str:
+        """以 ``state`` 提交二维码签到，返回结果页 DivOK 文案（无则空串）。
 
-        二维码签到仅对微信授权登录的会话有效；账号密码登录调用时服务端返回
-        语义含糊的「参数错误」，此处替换为准确提示。
+        ``state`` 可为活动 ID（直签），也可为 :meth:`resolve_qr_state` 从实时
+        二维码解码出的滚动令牌。提交前先按真实客户端路径访问一次学生签到页
+        （部分校验依赖该入口），提交时携带对应 Referer；限流文案与签到类
+        请求一致处理。
+
+        服务端以「参数错误」同时表达「会话非微信授权」与「state 不是当前
+        有效令牌」两种拒绝，此处如实返回原文，由调用方决定是否走解码回退。
         """
+        if course_id is not None:
+            try:
+                self._session.get(
+                    self._url("/_CheckIn/MB/CheckInStudent.aspx?moduleid=16&pasd="),
+                    headers={
+                        "Referer": (
+                            f"{self._settings.host}/_UserCenter/MB/Module.aspx"
+                            f"?data={course_id}"
+                        )
+                    },
+                    timeout=self._settings.request_timeout_s,
+                )
+            except requests.exceptions.RequestException:
+                pass  # 入口页访问失败不阻断签到本身
         response = self._session.get(
             self._url(f"/_CheckIn/MB/QrCodeCheckOK.aspx?state={state}"),
+            headers={"Referer": STUDENT_REFERER},
             timeout=self._settings.request_timeout_s,
         )
+        if self._limiter.is_limit_text(response.text):
+            self._limiter.trip()
+            raise RateLimited(
+                f"服务端提示签到过于频繁，已静默 "
+                f"{int(self._settings.cooldown_seconds)} 秒"
+            )
         if response.status_code != 200:
-            return "二维码签到请求失败"
+            return ""
         element = BeautifulSoup(response.text, "html.parser").find(id="DivOK")
-        text = element.get_text().strip() if element is not None else ""
-        if text == "参数错误,请重新尝试":
-            return "非微信链接登录，二维码无法签到"
-        return text
+        return element.get_text().strip() if element is not None else ""
+
+    def fetch_qr_image(self, course_id: str) -> bytes | None:
+        """拉取当前二维码签到的实时图片（服务端 base64 PNG）。
+
+        令牌随二维码周期刷新，活动 ID 直签被拒时需以此图解码出当前令牌。
+
+        Returns:
+            图片字节；服务端明确返回空数据为 ``b""``；网络/接口状态不明为
+            ``None``（调用方按「本轮不确定」处理，下一轮重试）。
+        """
+        headers = {
+            **FORM_HEADERS,
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": f"{self._settings.host}/_CheckIn/MB/TeachCheckIn.aspx",
+        }
+        try:
+            response = self._session.post(
+                self._url("/_CheckIn/CheckIn.ashx"),
+                data=f"action=getcodeimage&cid={course_id}",
+                headers=headers,
+                timeout=self._settings.request_timeout_s,
+            )
+        except requests.exceptions.RequestException:
+            return None
+        if response.status_code != 200:
+            return None
+        try:
+            data = response.json()
+        except ValueError:
+            return None
+        if str(data.get("msg")) != "1":
+            return None
+        encoded = str(data.get("data") or "")
+        if not encoded:
+            return b""
+        try:
+            return base64.b64decode(encoded)
+        except (ValueError, TypeError):
+            return None
+
+    def resolve_qr_state(self, image: bytes) -> str:
+        """解码实时二维码图片并取出滚动令牌 ``state``；取不出返回空串。
+
+        二维码内容通常为 ``QrCodeCheckOK.aspx?state=<令牌>``；部分活动为
+        ``G.aspx?OnlyId=...`` 短链，需再跟一次不自动重定向的请求、从
+        ``Location`` 中取 ``state``。
+
+        Raises:
+            QrDecodeUnavailable: 缺少 Pillow / pyzbar 解码依赖。
+        """
+        payload = decode_payload(image)
+        if not payload:
+            return ""
+        if "state=" in payload:
+            state = parse_qs(urlparse(payload).query).get("state", [""])[0]
+            if state:
+                return state
+        if "OnlyId=" in payload or "G.aspx" in payload:
+            response = self._session.get(
+                payload, allow_redirects=False,
+                timeout=self._settings.request_timeout_s,
+            )
+            location = response.headers.get("Location", "")
+            if "state=" in location:
+                return parse_qs(urlparse(location).query).get("state", [""])[0]
+        return ""
 
     def sign_by_location(self, longitude: float, latitude: float) -> str | None:
         """定位签到：坐标做微小抖动后提交；异常见 :meth:`_sign_post`。"""

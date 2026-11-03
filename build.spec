@@ -11,7 +11,9 @@ a = Analysis(
     pathex=["."],
     binaries=[],
     datas=[("web", "web")],
-    hiddenimports=[],
+    # pyzbar 携带的 libzbar 动态库由 hooks-contrib 收集，这里显式声明模块
+    # 入口，避免二维码解码依赖在打包产物中缺失。
+    hiddenimports=["pyzbar", "pyzbar.pyzbar", "pyzbar.zbar_library"],
     hookspath=[],
     runtime_hooks=[],
     excludes=[
