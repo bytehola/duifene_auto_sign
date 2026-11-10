@@ -1,7 +1,7 @@
 """对分易 App REST 接口封装。
 
-本模块是运行期唯一的认证与签到数据来源。账号登录、课程读取、用户信息、
-当前签到、教室坐标和四类签到提交都使用 App 接口。
+账号登录、课程读取、用户信息、学生个人记录、活动详情、
+教室坐标和四类签到提交都使用 App 接口。
 """
 
 from __future__ import annotations
@@ -9,20 +9,30 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 from urllib.parse import quote
 
 import requests
 
 from .config import IniStore
-from .errors import AppApiError, AuthError
+from .errors import AppApiError, AuthError, PermissionDenied
 from .models import Course
 from .settings import Settings
 
 ACCESS_TOKEN_LIFETIME_S = 30 * 60
 REFRESH_TOKEN_LIFETIME_S = 7 * 24 * 60 * 60
 TOKEN_REFRESH_AHEAD_S = 5 * 60
+CHINA_TZ = timezone(timedelta(hours=8))
+
+
+def parse_checkin_time(value: str) -> datetime:
+    """平台的无时区日期采用北京时间，兼容网页斜线和 App ISO 格式。"""
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        parsed = datetime.strptime(value, "%Y/%m/%d %H:%M:%S")
+    return parsed.replace(tzinfo=CHINA_TZ) if parsed.tzinfo is None else parsed
 
 
 @dataclass(frozen=True)
@@ -50,6 +60,8 @@ class AppCheckIn:
     check_in_status: str
     status_id: str
     status_name: str
+    student_id: str = ""
+    is_deleted: bool = False
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "AppCheckIn":
@@ -72,7 +84,16 @@ class AppCheckIn:
             check_in_status=str(check_in.get("checkInStatus") or ""),
             status_id=str(check_in.get("statusID") or ""),
             status_name=str(check_in.get("statusName") or ""),
+            student_id=str(check_in.get("studentID") or ""),
+            is_deleted=str(check_in.get("isDel") or "0").lower() in ("1", "true"),
         )
+
+    @property
+    def has_valid_times(self) -> bool:
+        try:
+            return parse_checkin_time(self.valid_date) >= parse_checkin_time(self.create_date)
+        except (ValueError, TypeError):
+            return False
 
     @property
     def is_attended(self) -> bool:
@@ -86,27 +107,23 @@ class AppCheckIn:
     def has_ended(self, now: datetime | None = None) -> bool:
         """签到是否已超过有效期；时间格式异常时返回 False。"""
         try:
-            valid_until = datetime.fromisoformat(self.valid_date)
+            valid_until = parse_checkin_time(self.valid_date)
         except ValueError:
             return False
-        current = now or (
-            datetime.now(valid_until.tzinfo)
-            if valid_until.tzinfo is not None
-            else datetime.now()
-        )
+        current = now or datetime.now(CHINA_TZ)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=CHINA_TZ)
         return current > valid_until
 
     def age_seconds(self, now: datetime | None = None) -> float | None:
         """签到创建后经过的秒数；创建时间不可解析时返回 None。"""
         try:
-            created_at = datetime.fromisoformat(self.create_date)
+            created_at = parse_checkin_time(self.create_date)
         except ValueError:
             return None
-        current = now or (
-            datetime.now(created_at.tzinfo)
-            if created_at.tzinfo is not None
-            else datetime.now()
-        )
+        current = now or datetime.now(CHINA_TZ)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=CHINA_TZ)
         return (current - created_at).total_seconds()
 
 
@@ -238,6 +255,38 @@ class DfAppApi:
             return AppCheckIn.from_payload(data)
         except ValueError:
             return None
+
+    def fetch_student_records(self, class_id: str) -> list[Mapping[str, Any]]:
+        """读取当前学生自己的考勤记录；不接受外部传入的学生身份。"""
+        identity = self._require_identity()
+        payload = self._request(
+            "GET", f"/CK/GetStudentInLogList/{quote(class_id, safe='')}/"
+            f"{quote(identity.user_id, safe='')}",
+        )
+        self._require_success(payload, "读取学生签到记录失败")
+        rows = payload.get("data")
+        if not isinstance(rows, list):
+            raise AppApiError("学生签到记录列表格式异常")
+        normalized = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise AppApiError("学生签到记录格式异常")
+            # 当前用户专属列表实测在缺勤、签到成功后均可能返回 StudentID=null。
+            # 仅归一化已观察到的自洽状态；非空的其他学生身份仍拒绝。
+            known_self_status = (
+                (str(row.get("StatusID")) == "2"
+                 and not row.get("CheckInStatus") and not row.get("CheckInDate"))
+                or (str(row.get("StatusID")) == "1"
+                    and str(row.get("CheckInStatus")) == "1" and bool(row.get("CheckInDate")))
+            )
+            null_self_id = "StudentID" in row and row["StudentID"] is None and known_self_status
+            if str(row.get("StudentID") or "") != identity.user_id and not null_self_id:
+                raise PermissionDenied("学生签到记录的身份归属不匹配，已停止处理")
+            activity_id = str(row.get("ID") or "")
+            if not activity_id.isdecimal() or int(activity_id) <= 0:
+                raise AppApiError("学生签到记录的活动标识无效")
+            normalized.append({**row, "StudentID": identity.user_id})
+        return normalized
 
     def fetch_checkin(self, activity_id: str) -> AppCheckIn | None:
         """按活动 ID 读取签到详情。"""
@@ -502,6 +551,8 @@ class DfAppApi:
         if response.status_code == 401:
             self.clear()
             raise AuthError("登录状态已失效，请重新登录账号")
+        if response.status_code == 403:
+            raise self._permission_error(path)
         if response.status_code != 200:
             raise AppApiError(f"请求失败（HTTP {response.status_code}）")
         try:
@@ -510,7 +561,18 @@ class DfAppApi:
             raise AppApiError("返回了无法解析的数据") from exc
         if not isinstance(payload, dict):
             raise AppApiError("返回了无效数据")
+        # App 服务端也会用 HTTP 200 包装业务码 403，不能按临时故障重试。
+        if str(payload.get("code")) == "403":
+            raise self._permission_error(path)
         return payload
+
+    @staticmethod
+    def _permission_error(path: str) -> PermissionDenied:
+        """提供接口上下文；省略路径参数，避免在日志里暴露具体记录 ID。"""
+        endpoint = "/" + "/".join(path.strip("/").split("/")[:2])
+        return PermissionDenied(
+            f"接口 {endpoint} 没有访问权限（403），请核对接口与账号角色"
+        )
 
     def _refresh_access_token(self) -> bool:
         """用 Refresh Token 换新 Token；仅服务端拒绝时清空登录态。"""

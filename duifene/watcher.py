@@ -8,10 +8,14 @@ import time
 from datetime import datetime
 
 from .api import DuifeneApi
-from .errors import AuthError, LogFn
-from .models import Course
+from .app_api import AppCheckIn, CHINA_TZ, parse_checkin_time
+from .errors import AuthError, LogFn, PermissionDenied, WebSessionError
+from .models import Course, Outcome
 from .processor import ActivityProcessor
 from .settings import Settings
+
+NUMERIC_CODE_POLL_S = 0.2
+NUMERIC_PRIORITY_WINDOW_S = 5.0
 
 
 class Watcher:
@@ -35,6 +39,9 @@ class Watcher:
         self._last_tick_ts = 0.0
         self._in_window: bool | None = None
         self._lock = threading.Lock()
+        self._seen_activities: set[str] = set()
+        self._numeric_deadline: datetime | None = None
+        self._pending_numeric: dict[str, AppCheckIn] = {}
 
     @property
     def is_running(self) -> bool:
@@ -60,6 +67,9 @@ class Watcher:
         self._processor.reset()
         self._consecutive_errors = 0
         self._in_window = None
+        self._seen_activities.clear()
+        self._numeric_deadline = None
+        self._pending_numeric.clear()
         with self._lock:
             course = self._course
         self._log(self._course_prefix(course, "开始监听"))
@@ -102,14 +112,32 @@ class Watcher:
         )
 
     def _run(self) -> None:
-        """轮询主体；认证失效时停止，普通异常按退避重试。"""
+        """认证失效或权限拒绝时停止，普通异常按退避重试。"""
+        next_discovery = 0.0
+        next_material = 0.0
         while not self._stop.is_set():
             try:
-                self._tick()
+                now = time.monotonic()
+                # 截止前优先完成短取码请求，避免较慢的活动发现恰好跨过码开放窗口。
+                if now >= next_discovery and not self._numeric_is_urgent():
+                    self._tick()
+                    next_discovery = time.monotonic() + self._poll_delay()
+                if self._pending_numeric and time.monotonic() >= next_material:
+                    self._numeric_tick()
+                    next_material = time.monotonic() + NUMERIC_CODE_POLL_S
+                self._consecutive_errors = 0
             except AuthError as exc:
                 with self._lock:
                     course = self._course
                 self._log(self._course_prefix(course, f"{exc!s}，监听已停止"))
+                self._stop.set()
+                break
+            except (PermissionDenied, WebSessionError) as exc:
+                with self._lock:
+                    course = self._course
+                self._log(
+                    self._course_prefix(course, f"监听失败：{exc!s}，监听已停止")
+                )
                 self._stop.set()
                 break
             except Exception as exc:  # noqa: BLE001 - 单轮失败不终止监控
@@ -130,15 +158,58 @@ class Watcher:
                 continue
             if self._stop.is_set():
                 break
-            self._sleep(
-                random.uniform(
-                    self._settings.poll_min_s,
-                    self._settings.poll_max_s,
-                )
-            )
+            now = time.monotonic()
+            waits = []
+            if self._pending_numeric:
+                waits.append(max(0.0, next_material - now))
+            if not self._numeric_is_urgent():
+                waits.append(max(0.0, next_discovery - now))
+            self._sleep(min(waits) if waits else self._poll_delay())
+
+    def _poll_delay(self) -> float:
+        """活动发现始终沿用界面配置；取码使用自己的短周期。"""
+        return random.uniform(self._settings.poll_min_s, self._settings.poll_max_s)
+
+    def _numeric_is_urgent(self) -> bool:
+        if not self._pending_numeric or self._numeric_deadline is None:
+            return False
+        remaining = (self._numeric_deadline - datetime.now(CHINA_TZ)).total_seconds()
+        return 0 < remaining <= NUMERIC_PRIORITY_WINDOW_S
+
+    def _set_pending_numeric(self, activities: list[AppCheckIn]) -> None:
+        self._pending_numeric = {a.activity_id: a for a in activities}
+        self._numeric_deadline = min(
+            (parse_checkin_time(a.valid_date) for a in activities), default=None,
+        )
+
+    def _numeric_tick(self) -> None:
+        """快速取码只读网页材料；不重跑学生记录与 App 详情发现。"""
+        self._last_tick_ts = time.time()
+        if self._stop.is_set():
+            return
+        with self._lock:
+            course = self._course
+        if course is None or not self._in_monitor_window():
+            self._set_pending_numeric([])
+            return
+        if self._api.limiter.is_blocking():
+            return
+        pending = [a for a in self._pending_numeric.values() if not a.has_ended()]
+        if not pending:
+            self._set_pending_numeric([])
+            return
+        refreshed = self._api.refresh_numeric_materials(course, pending)
+        keep = []
+        for activity in refreshed:
+            if self._stop.is_set():
+                break
+            outcome = self._processor.process(activity, course)
+            if outcome is Outcome.DEFERRED:
+                keep.append(activity)
+        self._set_pending_numeric(keep)
 
     def _tick(self) -> None:
-        """读取 App 当前签到并交给处理器。"""
+        """从当前学生的记录发现活动，交给处理器。"""
         self._last_tick_ts = time.time()
         if self._stop.is_set():
             return
@@ -162,10 +233,21 @@ class Watcher:
                 )
             )
         if not in_window or course is None:
+            self._set_pending_numeric([])
             return
-        activity = self._api.fetch_active_activity(course.course_id)
-        if activity is None:
-            self._consecutive_errors = 0
-            return
-        self._processor.process(activity, course)
+        pending = []
+        for activity in self._api.fetch_active_activities(course, include_numeric_materials=False):
+            if self._stop.is_set():
+                break
+            if activity.activity_id not in self._seen_activities:
+                self._seen_activities.add(activity.activity_id)
+                self._log(self._course_prefix(course, f"发现进行中的签到 {activity.activity_id}"))
+            outcome = self._processor.process(activity, course)
+            missing_numeric_code = not (
+                len(activity.code) == 4 and activity.code.isascii() and activity.code.isdigit()
+            )
+            if activity.check_type == "1" and missing_numeric_code and activity.has_valid_times:
+                if outcome is Outcome.DEFERRED:
+                    pending.append(activity)
+        self._set_pending_numeric(pending)
         self._consecutive_errors = 0
