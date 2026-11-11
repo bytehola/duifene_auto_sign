@@ -1,2 +1,4 @@
 requests>=2.31.0
 pywebview>=5.0
+Pillow>=10.0
+zxing-cpp>=3.1.1

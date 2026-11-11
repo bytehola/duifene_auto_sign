@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import math
 import random
+import time
 
 from .api import DuifeneApi
 from .app_api import AppCheckIn
-from .errors import LogFn, RateLimited
+from .errors import AuthError, LogFn, RateLimited
 from .models import Course, Outcome
 from .settings import Settings
 
@@ -15,6 +16,7 @@ LOCATION_OFFSET_MIN_M = 5.0
 LOCATION_OFFSET_MAX_M = 20.0
 METERS_PER_DEGREE_LATITUDE = 111_132.92
 METERS_PER_DEGREE_LONGITUDE = 111_320.0
+HEADCOUNT_CACHE_TTL_S = 1.0
 
 
 class ActivityProcessor:
@@ -31,6 +33,7 @@ class ActivityProcessor:
         self._log = log
         self._handled: set[str] = set()
         self._headcount_log: dict[str, tuple[int, int]] = {}
+        self._headcount_cache: dict[tuple[str, str, str], tuple[float, tuple[int, int]]] = {}
         self._result_logged: set[str] = set()
         self._wait_logged: set[tuple[str, str]] = set()
 
@@ -38,6 +41,7 @@ class ActivityProcessor:
         """清空跨轮次状态。"""
         self._handled.clear()
         self._headcount_log.clear()
+        self._headcount_cache.clear()
         self._result_logged.clear()
         self._wait_logged.clear()
 
@@ -46,6 +50,15 @@ class ActivityProcessor:
         activity_id = activity.activity_id
         if activity_id in self._handled:
             return Outcome.SKIPPED
+        identity = self._api.identity
+        if identity is None or activity.student_id != identity.user_id or activity.class_id != course.class_id:
+            raise AuthError("签到活动与当前学生或教学班不匹配，请重新登录学生账号")
+        if activity.is_deleted:
+            self._mark(course, activity_id, "活动已作废")
+            return Outcome.SKIPPED
+        if not activity.has_valid_times:
+            self._log_wait(activity_id, "活动有效期未知，暂不提交", course)
+            return Outcome.DEFERRED
         if activity.is_attended:
             self._mark(course, activity_id, "已签到，无需重复签到")
             return Outcome.SKIPPED
@@ -54,8 +67,9 @@ class ActivityProcessor:
             return Outcome.SKIPPED
 
         age = activity.age_seconds()
-        if age is None:
-            age = 0.0
+        if age is None or age < 0:
+            self._log_wait(activity_id, "活动创建时间异常，暂不提交", course)
+            return Outcome.DEFERRED
         if age > self._settings.stale_sign_minutes * 60:
             self._mark(
                 course,
@@ -66,6 +80,18 @@ class ActivityProcessor:
         if self._api.limiter.is_blocking():
             left = int(self._api.limiter.remaining())
             self._log_course(course, f"限流中，{left} 秒后恢复")
+            return Outcome.DEFERRED
+
+        if activity.check_type == "1" and not (
+            len(activity.code) == 4 and activity.code.isascii() and activity.code.isdigit()
+        ):
+            self._log_wait(activity_id, "已发现活动，但当前学生查询未返回有效签到码", course)
+            return Outcome.DEFERRED
+        if activity.check_type == "4" and len(activity.code) != 4:
+            self._log_wait(activity_id, "已发现活动，但当前学生查询未返回汉字答案", course)
+            return Outcome.DEFERRED
+        if activity.check_type == "2" and not activity.qr_token:
+            self._log_wait(activity_id, "已发现活动，但当前学生查询未返回二维码令牌", course)
             return Outcome.DEFERRED
 
         gate = self._headcount_gate(activity, age, course)
@@ -80,7 +106,13 @@ class ActivityProcessor:
         course: Course,
     ) -> Outcome | None:
         """人数门禁：需等待时返回 DEFERRED，可提交时返回 None。"""
-        counts = self._api.fetch_headcount(activity.activity_id)
+        cache_key = (activity.student_id, activity.class_id, activity.activity_id)
+        cached = self._headcount_cache.get(cache_key)
+        if cached is not None and time.monotonic() - cached[0] < HEADCOUNT_CACHE_TTL_S:
+            counts = cached[1]
+        else:
+            counts = self._api.fetch_headcount(activity.activity_id)
+            self._headcount_cache[cache_key] = (time.monotonic(), counts)
         signed, total = counts
         if total <= 0:
             return Outcome.DEFERRED
@@ -137,9 +169,6 @@ class ActivityProcessor:
     def _sign_code(self, activity: AppCheckIn, course: Course) -> Outcome:
         """提交签到码。"""
         code = activity.code
-        if len(code) != 4:
-            detail = self._api.fetch_checkin(activity.activity_id)
-            code = detail.code if detail is not None else ""
         if len(code) != 4:
             self._log_wait(
                 activity.activity_id,
