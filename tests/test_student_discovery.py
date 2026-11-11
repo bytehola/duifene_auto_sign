@@ -458,6 +458,26 @@ class SubmissionBoundaryTests(unittest.TestCase):
             self.assertEqual(self.processor.process(self.activity, self.course), Outcome.DEFERRED)
         self.assertEqual(self.api.fetch_headcount.call_count, 2)
 
+    def test_near_deadline_zero_total_is_refetched_before_window_closes(self):
+        activity = replace(self.activity, valid_date=(datetime.now(CHINA_TZ) + timedelta(seconds=3)).isoformat())
+        self.api.fetch_headcount.side_effect = [(0, 0), (1, 1)]
+        clock = [0.0]
+        with patch("duifene.processor.time.monotonic", side_effect=lambda: clock[0]):
+            self.assertEqual(self.processor.process(activity, self.course), Outcome.DEFERRED)
+            clock[0] = 0.2
+            self.assertEqual(self.processor.process(activity, self.course), Outcome.SIGNED)
+        self.assertEqual(self.api.fetch_headcount.call_count, 2)
+
+    def test_near_deadline_headcount_ratio_changes_are_not_hidden_by_cache(self):
+        activity = replace(self.activity, valid_date=(datetime.now(CHINA_TZ) + timedelta(seconds=3)).isoformat())
+        self.api.fetch_headcount.side_effect = [(0, 10), (5, 10)]
+        clock = [0.0]
+        with patch("duifene.processor.time.monotonic", side_effect=lambda: clock[0]):
+            self.assertEqual(self.processor.process(activity, self.course), Outcome.DEFERRED)
+            clock[0] = 0.2
+            self.assertEqual(self.processor.process(activity, self.course), Outcome.SIGNED)
+        self.assertEqual(self.api.fetch_headcount.call_count, 2)
+
 
 class NumericRetryTests(unittest.TestCase):
     def setUp(self):

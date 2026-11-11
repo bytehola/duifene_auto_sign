@@ -5,9 +5,10 @@ from __future__ import annotations
 import math
 import random
 import time
+from datetime import datetime
 
 from .api import DuifeneApi
-from .app_api import AppCheckIn
+from .app_api import AppCheckIn, CHINA_TZ, parse_checkin_time
 from .errors import AuthError, LogFn, RateLimited
 from .models import Course, Outcome
 from .settings import Settings
@@ -17,6 +18,7 @@ LOCATION_OFFSET_MAX_M = 20.0
 METERS_PER_DEGREE_LATITUDE = 111_132.92
 METERS_PER_DEGREE_LONGITUDE = 111_320.0
 HEADCOUNT_CACHE_TTL_S = 1.0
+HEADCOUNT_CACHE_BYPASS_WINDOW_S = 5.0
 
 
 class ActivityProcessor:
@@ -108,7 +110,10 @@ class ActivityProcessor:
         """人数门禁：需等待时返回 DEFERRED，可提交时返回 None。"""
         cache_key = (activity.student_id, activity.class_id, activity.activity_id)
         cached = self._headcount_cache.get(cache_key)
-        if cached is not None and time.monotonic() - cached[0] < HEADCOUNT_CACHE_TTL_S:
+        remaining = (parse_checkin_time(activity.valid_date) - datetime.now(CHINA_TZ)).total_seconds()
+        # 截止窗口内人数可能刚刚更新，旧值不能占用仅剩的提交机会。
+        if (remaining > HEADCOUNT_CACHE_BYPASS_WINDOW_S and cached is not None
+                and time.monotonic() - cached[0] < HEADCOUNT_CACHE_TTL_S):
             counts = cached[1]
         else:
             counts = self._api.fetch_headcount(activity.activity_id)
