@@ -9,12 +9,13 @@ from datetime import datetime
 
 from .api import DuifeneApi
 from .app_api import AppCheckIn, CHINA_TZ, parse_checkin_time
-from .errors import AuthError, LogFn, PermissionDenied, WebSessionError
+from .errors import AppApiError, AuthError, LogFn, PermissionDenied, WebSessionError
 from .models import Course, Outcome
 from .processor import ActivityProcessor
 from .settings import Settings
 
 NUMERIC_CODE_POLL_S = 0.2
+NUMERIC_ERROR_BACKOFF_MAX_S = 2.0
 NUMERIC_PRIORITY_WINDOW_S = 5.0
 
 
@@ -36,6 +37,7 @@ class Watcher:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._consecutive_errors = 0
+        self._numeric_failures = 0
         self._last_tick_ts = 0.0
         self._in_window: bool | None = None
         self._lock = threading.Lock()
@@ -66,6 +68,7 @@ class Watcher:
         self._stop.clear()
         self._processor.reset()
         self._consecutive_errors = 0
+        self._numeric_failures = 0
         self._in_window = None
         self._seen_activities.clear()
         self._numeric_deadline = None
@@ -124,7 +127,7 @@ class Watcher:
                     next_discovery = time.monotonic() + self._poll_delay()
                 if self._pending_numeric and time.monotonic() >= next_material:
                     self._numeric_tick()
-                    next_material = time.monotonic() + NUMERIC_CODE_POLL_S
+                    next_material = time.monotonic() + self._numeric_poll_delay()
                 self._consecutive_errors = 0
             except AuthError as exc:
                 with self._lock:
@@ -170,6 +173,14 @@ class Watcher:
         """活动发现始终沿用界面配置；取码使用自己的短周期。"""
         return random.uniform(self._settings.poll_min_s, self._settings.poll_max_s)
 
+    def _numeric_poll_delay(self) -> float:
+        """正常取码等待 0.2 秒；仅取码失败按 0.4、0.8、1.6、2 秒退避。"""
+        # 四次失败已经封顶，避免长期失败时指数计算溢出。
+        return min(
+            NUMERIC_CODE_POLL_S * (2 ** min(self._numeric_failures, 4)),
+            NUMERIC_ERROR_BACKOFF_MAX_S,
+        )
+
     def _numeric_is_urgent(self) -> bool:
         if not self._pending_numeric or self._numeric_deadline is None:
             return False
@@ -177,6 +188,8 @@ class Watcher:
         return 0 < remaining <= NUMERIC_PRIORITY_WINDOW_S
 
     def _set_pending_numeric(self, activities: list[AppCheckIn]) -> None:
+        if not activities or not self._pending_numeric.keys() & {a.activity_id for a in activities}:
+            self._numeric_failures = 0
         self._pending_numeric = {a.activity_id: a for a in activities}
         self._numeric_deadline = min(
             (parse_checkin_time(a.valid_date) for a in activities), default=None,
@@ -198,14 +211,27 @@ class Watcher:
         if not pending:
             self._set_pending_numeric([])
             return
-        refreshed = self._api.refresh_numeric_materials(course, pending)
-        keep = []
-        for activity in refreshed:
-            if self._stop.is_set():
-                break
-            outcome = self._processor.process(activity, course)
-            if outcome is Outcome.DEFERRED:
-                keep.append(activity)
+        try:
+            refreshed = self._api.refresh_numeric_materials(course, pending)
+            keep = []
+            for activity in refreshed:
+                if self._stop.is_set():
+                    break
+                outcome = self._processor.process(activity, course)
+                if outcome is Outcome.DEFERRED:
+                    keep.append(activity)
+        except (AuthError, PermissionDenied, WebSessionError):
+            raise  # 身份/权限问题仍交给 _run 停止监听。
+        except AppApiError as exc:
+            previous_delay = self._numeric_poll_delay()
+            self._numeric_failures += 1
+            delay = self._numeric_poll_delay()
+            if self._numeric_failures == 1 or previous_delay < NUMERIC_ERROR_BACKOFF_MAX_S <= delay:
+                self._log(self._course_prefix(
+                    course, f"数字取码异常：{exc!s}（{delay:g} 秒后重试）",
+                ))
+            return  # 不进入活动发现的长退避，也不重置发现的错误计数。
+        self._numeric_failures = 0
         self._set_pending_numeric(keep)
 
     def _tick(self) -> None:
@@ -235,8 +261,23 @@ class Watcher:
         if not in_window or course is None:
             self._set_pending_numeric([])
             return
+        discovered = self._api.fetch_active_activities(course, include_numeric_materials=False)
+        if not discovered and self._pending_numeric:
+            # 空列表可能是短暂缺失；仅保留当前学生/班级尚有效的候选，不能无限续命。
+            identity = self._api.identity
+            pending = [
+                a for a in self._pending_numeric.values()
+                if identity is not None and a.student_id == identity.user_id
+                and a.class_id == course.class_id and a.has_valid_times
+                and not a.has_ended() and not a.is_deleted and not a.is_attended
+                and a.age_seconds() is not None
+                and 0 <= a.age_seconds() <= self._settings.stale_sign_minutes * 60
+            ]
+            self._set_pending_numeric(pending)
+            self._consecutive_errors = 0
+            return
         pending = []
-        for activity in self._api.fetch_active_activities(course, include_numeric_materials=False):
+        for activity in discovered:
             if self._stop.is_set():
                 break
             if activity.activity_id not in self._seen_activities:

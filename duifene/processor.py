@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import random
+import time
 
 from .api import DuifeneApi
 from .app_api import AppCheckIn
@@ -15,6 +16,7 @@ LOCATION_OFFSET_MIN_M = 5.0
 LOCATION_OFFSET_MAX_M = 20.0
 METERS_PER_DEGREE_LATITUDE = 111_132.92
 METERS_PER_DEGREE_LONGITUDE = 111_320.0
+HEADCOUNT_CACHE_TTL_S = 1.0
 
 
 class ActivityProcessor:
@@ -31,6 +33,7 @@ class ActivityProcessor:
         self._log = log
         self._handled: set[str] = set()
         self._headcount_log: dict[str, tuple[int, int]] = {}
+        self._headcount_cache: dict[tuple[str, str, str], tuple[float, tuple[int, int]]] = {}
         self._result_logged: set[str] = set()
         self._wait_logged: set[tuple[str, str]] = set()
 
@@ -38,6 +41,7 @@ class ActivityProcessor:
         """清空跨轮次状态。"""
         self._handled.clear()
         self._headcount_log.clear()
+        self._headcount_cache.clear()
         self._result_logged.clear()
         self._wait_logged.clear()
 
@@ -102,7 +106,13 @@ class ActivityProcessor:
         course: Course,
     ) -> Outcome | None:
         """人数门禁：需等待时返回 DEFERRED，可提交时返回 None。"""
-        counts = self._api.fetch_headcount(activity.activity_id)
+        cache_key = (activity.student_id, activity.class_id, activity.activity_id)
+        cached = self._headcount_cache.get(cache_key)
+        if cached is not None and time.monotonic() - cached[0] < HEADCOUNT_CACHE_TTL_S:
+            counts = cached[1]
+        else:
+            counts = self._api.fetch_headcount(activity.activity_id)
+            self._headcount_cache[cache_key] = (time.monotonic(), counts)
         signed, total = counts
         if total <= 0:
             return Outcome.DEFERRED

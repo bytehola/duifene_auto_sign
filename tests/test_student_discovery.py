@@ -392,6 +392,154 @@ class SubmissionBoundaryTests(unittest.TestCase):
         self.assertEqual(watcher._pending_numeric, {})
         self.api.refresh_numeric_materials.assert_not_called()
 
+    def test_empty_discovery_preserves_live_numeric_candidate(self):
+        watcher = Watcher(Settings(), self.api, self.processor, self.logs.append)
+        watcher.set_course(self.course)
+        watcher._in_monitor_window = Mock(return_value=True)
+        watcher._set_pending_numeric([replace(self.activity, code="")])
+        self.api.fetch_active_activities.return_value = []
+        watcher._tick()
+        self.assertIn(self.activity.activity_id, watcher._pending_numeric)
+
+    def test_empty_discovery_clears_expired_or_foreign_candidates(self):
+        watcher = Watcher(Settings(), self.api, self.processor, self.logs.append)
+        watcher.set_course(self.course)
+        watcher._in_monitor_window = Mock(return_value=True)
+        self.api.fetch_active_activities.return_value = []
+        for candidate in (
+            replace(self.activity, valid_date=(datetime.now(CHINA_TZ) - timedelta(seconds=1)).isoformat()),
+            replace(self.activity, student_id="other"),
+            replace(self.activity, class_id="other"),
+        ):
+            with self.subTest(candidate=candidate):
+                watcher._set_pending_numeric([candidate])
+                watcher._tick()
+                self.assertEqual(watcher._pending_numeric, {})
+
+    def test_headcount_cache_expires_and_rechecks_gate(self):
+        self.api.fetch_headcount.side_effect = [(0, 10), (5, 10)]
+        clock = [0.0]
+        with patch("duifene.processor.time.monotonic", side_effect=lambda: clock[0]):
+            self.assertEqual(self.processor.process(self.activity, self.course), Outcome.DEFERRED)
+            clock[0] = 0.2
+            self.assertEqual(self.processor.process(self.activity, self.course), Outcome.DEFERRED)
+            clock[0] = 1.1
+            self.assertEqual(self.processor.process(self.activity, self.course), Outcome.SIGNED)
+        self.assertEqual(self.api.fetch_headcount.call_count, 2)
+
+    def test_headcount_cache_does_not_cross_activities(self):
+        self.api.fetch_headcount.return_value = (0, 10)
+        with patch("duifene.processor.time.monotonic", return_value=0.0):
+            self.processor.process(self.activity, self.course)
+            self.processor.process(replace(self.activity, activity_id="102"), self.course)
+        self.assertEqual(self.api.fetch_headcount.call_count, 2)
+
+    def test_reset_clears_headcount_cache(self):
+        self.api.fetch_headcount.return_value = (0, 10)
+        with patch("duifene.processor.time.monotonic", return_value=0.0):
+            self.processor.process(self.activity, self.course)
+            self.processor.reset()
+            self.processor.process(self.activity, self.course)
+        self.assertEqual(self.api.fetch_headcount.call_count, 2)
+
+    def test_headcount_cache_does_not_cross_student_identities(self):
+        self.api.fetch_headcount.return_value = (0, 10)
+        with patch("duifene.processor.time.monotonic", return_value=0.0):
+            self.processor.process(self.activity, self.course)
+            self.api.identity = AppIdentity("other", "other-self", "", "2")
+            self.processor.process(replace(self.activity, student_id="other-self"), self.course)
+        self.assertEqual(self.api.fetch_headcount.call_count, 2)
+
+    def test_failed_headcount_request_is_not_cached(self):
+        self.api.fetch_headcount.side_effect = [AppApiError("人数请求失败"), (0, 10)]
+        with patch("duifene.processor.time.monotonic", return_value=0.0):
+            with self.assertRaises(AppApiError):
+                self.processor.process(self.activity, self.course)
+            self.assertEqual(self.processor.process(self.activity, self.course), Outcome.DEFERRED)
+        self.assertEqual(self.api.fetch_headcount.call_count, 2)
+
+
+class NumericRetryTests(unittest.TestCase):
+    def setUp(self):
+        self.api = Mock()
+        self.api.identity = AppIdentity("student", "self", "", "2")
+        self.api.limiter.is_blocking.return_value = False
+        self.activity = replace(detail(class_row(), record()), code="")
+        self.api.refresh_numeric_materials.return_value = [self.activity]
+        self.processor = Mock()
+        self.processor.process.return_value = Outcome.DEFERRED
+        self.logs = []
+        self.watcher = Watcher(Settings(), self.api, self.processor, self.logs.append)
+        self.watcher.set_course(Course("course", "class", "课程"))
+        self.watcher._in_monitor_window = Mock(return_value=True)
+        self.watcher._set_pending_numeric([self.activity])
+
+    def test_numeric_backoff_grows_independently_and_caps(self):
+        self.api.refresh_numeric_materials.side_effect = AppApiError("网络失败")
+        self.watcher._consecutive_errors = 3
+        for expected in (0.4, 0.8, 1.6, 2.0, 2.0):
+            self.watcher._numeric_tick()
+            self.assertAlmostEqual(self.watcher._numeric_poll_delay(), expected)
+            self.assertEqual(self.watcher._consecutive_errors, 3)
+        self.assertIn(self.activity.activity_id, self.watcher._pending_numeric)
+
+    def test_recovery_resets_numeric_backoff_to_normal(self):
+        self.api.refresh_numeric_materials.side_effect = [AppApiError("网络失败"), [self.activity]]
+        self.watcher._numeric_tick()
+        self.watcher._numeric_tick()
+        self.assertEqual(self.watcher._numeric_failures, 0)
+        self.assertEqual(self.watcher._numeric_poll_delay(), 0.2)
+
+    def test_fatal_numeric_errors_still_escape_to_stop_monitoring(self):
+        for error in (AuthError("失效"), PermissionDenied("403"), WebSessionError("网页失效")):
+            with self.subTest(error=error):
+                self.api.refresh_numeric_materials.side_effect = error
+                with self.assertRaises(type(error)):
+                    self.watcher._numeric_tick()
+
+    def test_failure_logs_only_first_and_first_cap_per_streak(self):
+        self.api.refresh_numeric_materials.side_effect = AppApiError("网络失败")
+        for _ in range(10):
+            self.watcher._numeric_tick()
+        self.assertEqual(len(self.logs), 2)
+
+    def test_large_failure_count_does_not_overflow_backoff(self):
+        self.watcher._numeric_failures = 10000
+        self.assertEqual(self.watcher._numeric_poll_delay(), 2.0)
+
+    def test_headcount_failure_uses_numeric_backoff_too(self):
+        self.processor.process.side_effect = AppApiError("人数请求失败")
+        self.watcher._numeric_tick()
+        self.assertEqual(self.watcher._numeric_poll_delay(), 0.4)
+
+    def test_empty_queue_resets_failure_streak(self):
+        self.api.refresh_numeric_materials.side_effect = AppApiError("网络失败")
+        self.watcher._numeric_tick()
+        self.watcher._set_pending_numeric([])
+        self.assertEqual(self.watcher._numeric_poll_delay(), 0.2)
+
+    def test_run_uses_numeric_backoff_without_blocking_discovery(self):
+        clock = [0.0]
+        material_times = []
+        discovery_times = []
+        def fail_material(*_args):
+            material_times.append(clock[0])
+            raise AppApiError("网络失败")
+        def discover():
+            discovery_times.append(clock[0])
+        def sleep(seconds):
+            clock[0] += max(seconds, 0.000001)
+            if clock[0] >= 4.9:
+                self.watcher._stop.set()
+        self.watcher._poll_delay = Mock(return_value=3.0)
+        self.watcher._tick = Mock(side_effect=discover)
+        self.watcher._sleep = sleep
+        self.api.refresh_numeric_materials.side_effect = fail_material
+        with patch("duifene.watcher.time.monotonic", side_effect=lambda: clock[0]):
+            self.watcher._run()
+        self.assertEqual(discovery_times, [0.0, 3.0])
+        self.assertEqual([round(x, 2) for x in material_times], [0.0, 0.4, 1.2, 2.8, 4.8])
+
 
 if __name__ == "__main__":
     unittest.main()

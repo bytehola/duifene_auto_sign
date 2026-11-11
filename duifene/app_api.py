@@ -242,7 +242,11 @@ class DfAppApi:
         return courses
 
     def fetch_active_checkin(self, course_id: str) -> AppCheckIn | None:
-        """读取课程当前进行中的签到；没有活动时返回 None。"""
+        """保留旧接口以回归 HTTP/业务 403 语义，不用于学生监听。
+
+        学生身份会被此入口拒绝。新业务与旧 e2e 调用方应迁移至
+        ``DuifeneApi.fetch_active_activities(course)``，不再使用旧单活动门面。
+        """
         payload = self._request(
             "GET",
             f"/CK/GetModelByInProgress/{quote(str(course_id), safe='')}",

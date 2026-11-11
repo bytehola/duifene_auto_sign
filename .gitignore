@@ -7,5 +7,12 @@ build_env/
 dist/
 *.zip
 
+# 本地私有测试默认不入库；只放行使用合成数据的回归测试。
+# 新增公开测试须显式登记，避免误提交真实账号和课程数据。
+tests/*
+!tests/test_permissions.py
+!tests/test_student_discovery.py
+!tests/test_web_qr.py
+
 analysis-session/
 分析数据/
