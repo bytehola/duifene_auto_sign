@@ -13,6 +13,3 @@ tests/*
 !tests/test_permissions.py
 !tests/test_student_discovery.py
 !tests/test_web_qr.py
-
-analysis-session/
-分析数据/

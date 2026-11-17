@@ -65,6 +65,8 @@ class WebQrTests(unittest.TestCase):
         self.assertEqual(self.web.fetch_token("course"), TOKEN)
         calls = self.session.request.call_args_list
         self.assertEqual(calls[1].kwargs["data"], {"action": "loginmb", "loginname": "student", "password": "test&password"})
+        self.assertEqual(calls[0].kwargs["timeout"], 60.0)
+        self.assertEqual(calls[1].kwargs["timeout"], 60.0)
         self.assertEqual(calls[-1].kwargs["data"], {"action": "getcodeimage", "cid": "course"})
         self.assertFalse(calls[-1].kwargs["allow_redirects"])
         self.assertFalse(self.session.trust_env)
@@ -96,6 +98,14 @@ class WebQrTests(unittest.TestCase):
         with self.assertRaises(WebSessionError):
             self.web.fetch_token("course")
         self.session.request.assert_not_called()
+
+    def test_switch_to_student_toggles_from_teacher_once(self):
+        self.session.request.side_effect = self.login + [
+            response({"msg": "1", "msgbox": "切换为教师身份"}),
+            response({"msg": "2", "msgbox": "切换为学生身份"}),
+        ]
+        self.assertEqual(self.web.switch_to_student(), "切换为学生身份")
+        self.assertEqual(self.session.request.call_count, 4)
 
 
 class NumericWebTests(unittest.TestCase):

@@ -1,13 +1,16 @@
 """权限拒绝必须停止监听，且不能误清理仍然有效的登录态。"""
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock
 
 import requests
 
 from duifene.api import DuifeneApi
-from duifene.app_api import DfAppApi
+from duifene.app_api import AppCheckIn, AppIdentity, DfAppApi
+from duifene.config import IniStore
 from duifene.credentials import SavedCredentials
 from duifene.errors import AppApiError, AuthError, PermissionDenied
 from duifene.models import Course
@@ -141,6 +144,98 @@ class PermissionApiTests(unittest.TestCase):
         self.assertEqual(api.identity.account, "test-account")
         session.post.assert_called_once()
 
+    def test_login_registers_dual_identity_and_switches_teacher_to_student(self):
+        settings = Settings()
+        session = Mock(spec=requests.Session)
+        api = DuifeneApi(session, settings, RateLimiter(settings))
+        identities = iter([
+            AppIdentity("test-account", "test-user", "", "1", "2"),
+            AppIdentity("test-account", "test-user", "", "1", "3"),
+            AppIdentity("test-account", "test-user", "", "2", "3"),
+        ])
+
+        def login_result(*_args):
+            api._app_api._identity = next(identities)
+            return True
+
+        api._app_api.login = Mock(side_effect=login_result)
+        api._app_api.register_double_user_type = Mock(return_value="申请成功")
+        api._student_web.switch_to_student = Mock(return_value="切换为学生身份")
+
+        self.assertEqual(
+            api.login_by_password("test-account", "test-password"),
+            "登录成功",
+        )
+        api._app_api.register_double_user_type.assert_called_once_with()
+        api._student_web.switch_to_student.assert_called_once_with()
+        self.assertEqual(api._app_api.login.call_count, 3)
+        self.assertEqual(api.identity.user_type_id, "2")
+        self.assertEqual(api.identity.final_user_type_id, "3")
+
+    def test_room_coordinates_are_persisted_and_restored(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings()
+            settings.ini_filename = str(Path(temp_dir) / "duifenyi.ini")
+            store = IniStore(settings.ini_filename)
+            store.ensure_exists()
+            activity = AppCheckIn.from_payload({
+                "id": "101",
+                "tClassID": "202",
+                "checkInType": "3",
+                "roomID": "4499883696309602",
+                "createrDate": "2026/11/18 10:00:00",
+                "validDate": "2026/11/18 10:10:00",
+            })
+
+            first_api = DuifeneApi(
+                Mock(spec=requests.Session),
+                settings,
+                RateLimiter(settings),
+                store,
+            )
+            first_api._app_api.fetch_room_coordinates = Mock(
+                return_value=(104.0668, 30.5728)
+            )
+            self.assertEqual(
+                first_api.fetch_room_coordinates(activity),
+                (104.0668, 30.5728),
+            )
+            self.assertEqual(
+                store.load_room_coordinates(),
+                {"4499883696309602": (104.0668, 30.5728)},
+            )
+
+            restored_api = DuifeneApi(
+                Mock(spec=requests.Session),
+                settings,
+                RateLimiter(settings),
+                store,
+            )
+            restored_api._app_api.fetch_room_coordinates = Mock()
+            self.assertEqual(
+                restored_api.fetch_room_coordinates(activity),
+                (104.0668, 30.5728),
+            )
+            restored_api._app_api.fetch_room_coordinates.assert_not_called()
+
+    def test_invalid_persisted_room_coordinates_are_ignored(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ini_path = Path(temp_dir) / "duifenyi.ini"
+            ini_path.write_text(
+                "[ROOM_COORDINATES]\n"
+                "0=104.0,30.0\n"
+                "bad=104.0,30.0\n"
+                "101=0,0\n"
+                "102=181,30\n"
+                "103=104.0,30.0\n",
+                encoding="utf-8",
+            )
+            store = IniStore(str(ini_path))
+            self.assertEqual(
+                store.load_room_coordinates(),
+                {"103": (104.0, 30.0)},
+            )
+
 
 class PermissionWatcherTests(unittest.TestCase):
     def setUp(self):
@@ -164,6 +259,18 @@ class PermissionWatcherTests(unittest.TestCase):
         self.watcher._sleep.assert_not_called()
         self.assertTrue(any("监听已停止" in line and "403" in line for line in self.logs))
         self.assertFalse(any("后重试" in line for line in self.logs))
+
+    def test_auth_error_notifies_recovery_callback(self):
+        self.api.fetch_active_activities.side_effect = AuthError("登录状态已失效")
+        recovery_callback = Mock()
+        self.watcher._on_auth_lost = recovery_callback
+        self.watcher._sleep = Mock()
+
+        self.watcher.start()
+        self.watcher._thread.join(timeout=2)
+
+        self.assertFalse(self.watcher.is_running)
+        recovery_callback.assert_called_once_with()
 
     def test_network_failure_still_retries_and_recovers(self):
         self.api.fetch_active_activities.side_effect = [AppApiError("网络请求失败"), []]

@@ -43,6 +43,17 @@ class AppIdentity:
     user_id: str
     user_name: str
     user_type_id: str
+    final_user_type_id: str = ""
+
+    @property
+    def has_student_role(self) -> bool:
+        """当前账号是否具备学生身份。"""
+        return self.user_type_id == "2" or self.final_user_type_id == "3"
+
+    @property
+    def course_user_type_id(self) -> str:
+        """签到监听使用的课程身份；双身份优先按学生读取课程。"""
+        return "2" if self.has_student_role else self.user_type_id
 
 
 @dataclass(frozen=True)
@@ -192,7 +203,7 @@ class DfAppApi:
                 self._url("/Auth/login"),
                 json={"username": username, "password": password},
                 headers={"Content-Type": "application/json"},
-                timeout=self._settings.request_timeout_s,
+                timeout=self._settings.login_timeout_s,
             )
             payload = response.json()
         except (requests.exceptions.RequestException, ValueError):
@@ -212,11 +223,12 @@ class DfAppApi:
     def fetch_courses(self) -> list[Course]:
         """读取当前用户课程及教学班。"""
         identity = self._require_identity()
+        user_type_id = identity.course_user_type_id
         course_path = {
             "1": "/Course/GetTeacherCourseList",
             "2": "/Course/GetStudentCourseList",
             "3": "/Course/GetAssistantCourseList",
-        }.get(identity.user_type_id, "/Course/GetStudentCourseList")
+        }.get(user_type_id, "/Course/GetStudentCourseList")
         payload = self._request("GET", course_path)
         self._require_success(payload, "未返回课程")
         data = payload.get("data")
@@ -232,7 +244,7 @@ class DfAppApi:
             course_name = str(raw_course.get("courseName") or "").strip()
             if not course_id or course_id == "0":
                 continue
-            classes = self._fetch_classes(course_id, identity.user_type_id)
+            classes = self._fetch_classes(course_id, user_type_id)
             for class_id, class_name in classes:
                 display_name = course_name
                 if len(classes) > 1 and class_name:
@@ -245,6 +257,17 @@ class DfAppApi:
                     )
                 )
         return courses
+
+    def register_double_user_type(self) -> str:
+        """为当前账号申请教师与学生双重身份。"""
+        identity = self._require_identity()
+        payload = self._request(
+            "POST",
+            f"/User/DoubleUserType/{quote(identity.user_id, safe='')}",
+            timeout_s=self._settings.login_timeout_s,
+        )
+        self._require_success(payload, "教师身份申请失败")
+        return str(payload.get("message") or "申请成功")
 
     def fetch_active_checkin(self, course_id: str) -> AppCheckIn | None:
         """保留旧接口以回归 HTTP/业务 403 语义，不用于学生监听。
@@ -404,6 +427,7 @@ class DfAppApi:
         if not token:
             return False
         with self._auth_lock:
+            previous_identity = self._identity
             now = time.time()
             self._token = token
             self._token_expires_at = now + ACCESS_TOKEN_LIFETIME_S
@@ -420,11 +444,22 @@ class DfAppApi:
                 user_id = str(user_info.get("userId") or "")
                 account = str(user_info.get("userLogin") or "")
                 if user_id and account:
+                    user_type_id = str(user_info.get("userTypeID") or "")
+                    final_user_type_value = user_info.get("finalUserType")
+                    if final_user_type_value not in (None, ""):
+                        final_user_type_id = str(final_user_type_value)
+                    elif (previous_identity is not None
+                          and previous_identity.user_id == user_id
+                          and previous_identity.account == account):
+                        final_user_type_id = previous_identity.final_user_type_id
+                    else:
+                        final_user_type_id = user_type_id
                     self._identity = AppIdentity(
                         account=account,
                         user_id=user_id,
                         user_name=str(user_info.get("userName") or ""),
-                        user_type_id=str(user_info.get("userTypeID") or ""),
+                        user_type_id=user_type_id,
+                        final_user_type_id=final_user_type_id,
                     )
             if self._identity is None or not self._refresh_token:
                 return False
@@ -449,6 +484,9 @@ class DfAppApi:
         account = str(values.get("account") or "")
         user_id = str(values.get("user_id") or "")
         user_type_id = str(values.get("user_type_id") or "")
+        final_user_type_id = str(
+            values.get("final_user_type_id") or user_type_id
+        )
         if (
             not token
             or not refresh_token
@@ -469,6 +507,7 @@ class DfAppApi:
                 user_id=user_id,
                 user_name=str(values.get("user_name") or ""),
                 user_type_id=user_type_id,
+                final_user_type_id=final_user_type_id,
             )
 
     def _save_session(self) -> None:
@@ -486,6 +525,7 @@ class DfAppApi:
                 "user_id": self._identity.user_id,
                 "user_name": self._identity.user_name,
                 "user_type_id": self._identity.user_type_id,
+                "final_user_type_id": self._identity.final_user_type_id,
                 "access_token": self._token,
                 "access_expires_at": f"{self._token_expires_at:.3f}",
                 "refresh_token": self._refresh_token,
@@ -529,6 +569,7 @@ class DfAppApi:
         *,
         json_data: Mapping[str, Any] | None = None,
         allow_refresh: bool = True,
+        timeout_s: float | None = None,
     ) -> dict[str, Any]:
         """发起带 Bearer Token 的请求。"""
         self.ensure_session_fresh()
@@ -545,7 +586,7 @@ class DfAppApi:
                     "Authorization": f"Bearer {request_token}",
                     "Content-Type": "application/json",
                 },
-                timeout=self._settings.request_timeout_s,
+                timeout=timeout_s or self._settings.request_timeout_s,
             )
         except requests.exceptions.RequestException as exc:
             raise AppApiError(
@@ -558,6 +599,7 @@ class DfAppApi:
                 path,
                 json_data=json_data,
                 allow_refresh=False,
+                timeout_s=timeout_s,
             )
         if response.status_code == 401:
             self.clear()

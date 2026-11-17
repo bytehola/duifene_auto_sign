@@ -201,6 +201,58 @@ class DiscoveryTests(unittest.TestCase):
             self.api.fetch_active_activities(self.course)
         self.session.request.assert_not_called()
 
+    def test_dual_role_teacher_primary_uses_student_course_and_teacher_material(self):
+        self.api._app_api._identity = AppIdentity(
+            "dual", "self", "", "1", "3"
+        )
+        self.api._app_api.fetch_checkin = Mock(return_value=detail(
+            class_row(CheckInCode=""),
+            record(),
+        ))
+        self.api._app_api.fetch_active_checkin = Mock(return_value=detail(
+            class_row(CheckInCode="0073"),
+            record(),
+        ))
+        activities = self.api.fetch_active_activities(
+            self.course,
+            include_numeric_materials=False,
+        )
+        self.assertEqual(len(activities), 1)
+        self.assertEqual(activities[0].code, "0073")
+        self.assertEqual(activities[0].student_id, "self")
+
+    def test_dual_role_student_primary_uses_temporary_teacher_material(self):
+        self.api._app_api._identity = AppIdentity(
+            "dual", "self", "", "2", "3"
+        )
+        self.api._app_api.login = Mock()
+        self.api._app_api.fetch_active_checkin = Mock(return_value=detail(
+            class_row(CheckInCode="0073"),
+            record(),
+        ))
+        self.api._app_api.fetch_checkin = Mock(return_value=detail(
+            class_row(CheckInCode=""),
+            record(),
+        ))
+        self.api._student_web.switch_to_teacher = Mock(
+            return_value="切换为教师身份"
+        )
+        self.api._student_web.switch_to_student = Mock(
+            return_value="切换为学生身份"
+        )
+
+        activities = self.api.fetch_active_activities(
+            self.course,
+            include_numeric_materials=False,
+        )
+
+        self.assertEqual(len(activities), 1)
+        self.assertEqual(activities[0].code, "0073")
+        self.assertEqual(self.api.identity.user_type_id, "2")
+        self.api._student_web.switch_to_teacher.assert_called_once_with()
+        self.api._student_web.switch_to_student.assert_called_once_with()
+        self.api._app_api.login.assert_not_called()
+
     def test_clear_removes_course_membership(self):
         self.api.clear_session()
         self.assertFalse(self.api.app_authenticated)
