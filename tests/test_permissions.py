@@ -6,9 +6,12 @@ from unittest.mock import Mock
 
 import requests
 
+from duifene.api import DuifeneApi
 from duifene.app_api import DfAppApi
-from duifene.errors import AppApiError, PermissionDenied
+from duifene.credentials import SavedCredentials
+from duifene.errors import AppApiError, AuthError, PermissionDenied
 from duifene.models import Course
+from duifene.rate_limit import RateLimiter
 from duifene.settings import Settings
 from duifene.watcher import Watcher
 
@@ -17,6 +20,14 @@ def response(status, payload=None):
     result = requests.Response()
     result.status_code = status
     result._content = json.dumps(payload).encode("utf-8") if payload else b""
+    return result
+
+
+def plain_response(status, text):
+    result = requests.Response()
+    result.status_code = status
+    result.headers["Content-Type"] = "text/plain; charset=utf-8"
+    result._content = text.encode("utf-8")
     return result
 
 
@@ -72,6 +83,63 @@ class PermissionApiTests(unittest.TestCase):
             self.api.fetch_active_checkin("test-course")
         self.assertNotIsInstance(caught.exception, PermissionDenied)
         self.assertTrue(self.api.is_authenticated)
+
+    def test_refresh_401_plain_text_invalidates_session(self):
+        self.session.get.return_value = plain_response(
+            401,
+            "登录已过期，请重新登录",
+        )
+        with self.assertRaises(AuthError):
+            self.api.ensure_session_fresh(force=True)
+        self.assertFalse(self.api.is_authenticated)
+        self.session.get.assert_called_once()
+
+    def test_expired_refresh_token_relogs_with_saved_credentials(self):
+        settings = Settings()
+        session = Mock(spec=requests.Session)
+        api = DuifeneApi(session, settings, RateLimiter(settings))
+        api._app_api._store_login_payload(
+            {
+                "success": True,
+                "code": 200,
+                "data": {
+                    "token": "old-access",
+                    "refreshToken": "expired-refresh",
+                    "userInfo": {
+                        "userId": "test-user",
+                        "userLogin": "test-account",
+                        "userTypeID": "2",
+                    },
+                },
+            },
+            initial_login=True,
+        )
+        api._login_credentials = SavedCredentials("test-account", "test-password")
+        api._app_api._token_expires_at = 0
+        session.get.return_value = plain_response(
+            401,
+            "登录已过期，请重新登录",
+        )
+        session.post.return_value = response(
+            200,
+            {
+                "success": True,
+                "code": 200,
+                "data": {
+                    "token": "new-access",
+                    "refreshToken": "new-refresh",
+                    "userInfo": {
+                        "userId": "test-user",
+                        "userLogin": "test-account",
+                        "userTypeID": "2",
+                    },
+                },
+            },
+        )
+        self.assertTrue(api.ensure_session_fresh(force=True))
+        self.assertEqual(api._app_api._token, "new-access")
+        self.assertEqual(api.identity.account, "test-account")
+        session.post.assert_called_once()
 
 
 class PermissionWatcherTests(unittest.TestCase):

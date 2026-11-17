@@ -81,6 +81,7 @@ build_env\Scripts\pyinstaller build.spec --noconfirm
 - Refresh Token 按 7 天保存；刷新响应返回新值时同步更新，未返回时保留旧值。
 - 后台每分钟检查一次会话，不依赖是否正在监听课程。
 - 临时断网不会删除 Refresh Token，恢复网络后会继续重试。
+- Refresh Token 被服务端拒绝时，会立即使用已保存账号密码重新登录；失败才提示重新登录。
 - 下次启动优先恢复 App 会话；会话不可用时使用保存的账号密码自动登录。
 - Windows 下密码使用当前系统用户的 DPAPI 加密，其他平台使用权限为 `0600` 的本地配置文件。
 

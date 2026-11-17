@@ -36,6 +36,20 @@ class DuifeneApi:
         self._credentials = CredentialStore(session_store) if session_store is not None else None
         self._login_credentials: SavedCredentials | None = None
         self._student_web = StudentWebApi(settings, self._web_credentials)
+        self._app_api.set_reauth_callback(self._relogin_with_saved_credentials)
+
+    def _relogin_with_saved_credentials(self) -> bool:
+        """Refresh Token 被拒后，用当前或落盘凭据重新登录一次。"""
+        credentials = self._login_credentials
+        if credentials is None and self._credentials is not None:
+            credentials = self._credentials.load()
+        if credentials is None:
+            return False
+        with self._operation_lock:
+            if not self._app_api.login(credentials.account, credentials.password):
+                return False
+            self._login_credentials = credentials
+            return True
 
     def _web_credentials(self) -> SavedCredentials | None:
         identity = self.identity

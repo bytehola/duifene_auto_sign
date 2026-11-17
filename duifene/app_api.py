@@ -10,7 +10,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from urllib.parse import quote
 
 import requests
@@ -145,6 +145,7 @@ class DfAppApi:
         self._token_expires_at = 0.0
         self._refresh_expires_at = 0.0
         self._identity: AppIdentity | None = None
+        self._reauth_callback: Callable[[], bool] | None = None
         self._restore_persisted_session()
 
     @property
@@ -162,6 +163,10 @@ class DfAppApi:
     def identity(self) -> AppIdentity | None:
         """当前 App 用户信息。"""
         return self._identity
+
+    def set_reauth_callback(self, callback: Callable[[], bool]) -> None:
+        """设置 Refresh Token 被拒后使用的本地凭据重登回调。"""
+        self._reauth_callback = callback
 
     def clear(self) -> None:
         """清空 App 登录态。"""
@@ -512,6 +517,8 @@ class DfAppApi:
             if not force and time.time() < refresh_deadline:
                 return False
             if not self._refresh_access_token():
+                if self._reauth_callback is not None and self._reauth_callback():
+                    return True
                 raise AuthError("登录状态已失效，请重新登录账号")
             return True
 
@@ -603,10 +610,6 @@ class DfAppApi:
                 )
             except requests.exceptions.RequestException as exc:
                 raise AppApiError("登录状态续期失败，请检查网络或代理设置") from exc
-            try:
-                payload = response.json()
-            except ValueError as exc:
-                raise AppApiError("登录状态续期返回了无法解析的数据") from exc
             if response.status_code in (400, 401, 403):
                 self.clear()
                 return False
@@ -614,6 +617,10 @@ class DfAppApi:
                 raise AppApiError(
                     f"登录状态续期失败（HTTP {response.status_code}）"
                 )
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise AppApiError("登录状态续期返回了无法解析的数据") from exc
             if not isinstance(payload, Mapping):
                 raise AppApiError("登录状态续期返回了无效数据")
             if not self._store_login_payload(payload, initial_login=False):
