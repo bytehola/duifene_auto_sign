@@ -63,8 +63,13 @@ class Bridge:
             self._api,
             self._processor,
             self._log,
+            self._schedule_session_recovery,
         )
-        self._session_keeper = SessionKeeper(self._api, self._log)
+        self._session_keeper = SessionKeeper(
+            self._api,
+            self._log,
+            self._schedule_session_recovery,
+        )
         self._courses: list[Course] = []
         self._course: Course | None = None
         self._user_account = ""
@@ -77,6 +82,9 @@ class Bridge:
         self._log_lock = threading.Lock()
         self._log_seq = 0
         self._pending_notice: dict[str, str] | None = None
+        self._watching_requested = False
+        self._recovery_lock = threading.Lock()
+        self._recovery_thread: threading.Thread | None = None
 
     # ─ 内部：会话与日志 ─────────────────────────────────────────────
     def _build_session(self, settings: Settings) -> requests.Session:
@@ -147,6 +155,7 @@ class Bridge:
 
     def _on_login_invalid(self) -> None:
         """App 登录态失效时清理课程、停止监听并告警。"""
+        self._watching_requested = False
         self._clear_login_state()
         self._notify("error", "登录状态失效，请重新登录账号")
 
@@ -163,7 +172,7 @@ class Bridge:
         self._watcher.stop()
 
     # ─ 内部：课程 / 登录共用逻辑 ────────────────────────────────────
-    def _refresh_courses(self) -> str:
+    def _refresh_courses(self, preferred_course_key: str = "") -> str:
         """拉取课程列表并选中首门；返回错误文案，成功返回空串。
 
         Raises:
@@ -174,9 +183,77 @@ class Bridge:
             if not self._courses:
                 return "未返回课程"
             self._logged_in = True
-            self._select_course(self._course_key(self._courses[0]))
+            selected_key = preferred_course_key
+            if not selected_key or not any(
+                self._course_key(course) == selected_key
+                for course in self._courses
+            ):
+                selected_key = self._course_key(self._courses[0])
+            self._select_course(selected_key)
             self._refresh_user_identity()
             return ""
+
+    def _schedule_session_recovery(self) -> None:
+        """登录失效时启动一次后台恢复线程。"""
+        with self._recovery_lock:
+            if (self._recovery_thread is not None
+                    and self._recovery_thread.is_alive()):
+                return
+            self._recovery_thread = threading.Thread(
+                target=self._recover_session,
+                name="duifene-session-recovery",
+                daemon=True,
+            )
+            self._recovery_thread.start()
+
+    def _recover_session(self) -> None:
+        """使用保存凭据重登，并恢复失效前正在监听的课程。"""
+        course_key = self._course_key(self._course) if self._course else ""
+        should_resume_watching = self._watching_requested
+        credentials = self._credentials.load()
+        if credentials is None:
+            self._on_login_invalid()
+            return
+
+        self._log("登录状态失效，正在使用已保存账号自动恢复")
+        self._session_keeper.stop()
+        self._watcher.stop()
+        last_error = ""
+        for attempt in range(3):
+            try:
+                message = self._api.login_by_password(
+                    credentials.account,
+                    credentials.password,
+                )
+                if message != "登录成功":
+                    last_error = message
+                else:
+                    course_error = self._refresh_courses(course_key)
+                    if course_error:
+                        last_error = f"恢复课程失败：{course_error}"
+                    else:
+                        self._session_keeper.start()
+                        if should_resume_watching and self._course is not None:
+                            self._watcher.start()
+                            message = (
+                                f"登录状态已自动恢复，继续监听"
+                                f"【{self._course.name}】"
+                            )
+                        else:
+                            message = "登录状态已自动恢复"
+                        self._log(message)
+                        self._pending_notice = {
+                            "level": "success",
+                            "text": message,
+                        }
+                        return
+            except (AppApiError, AuthError) as exc:
+                last_error = str(exc)
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+
+        self._log(f"自动恢复登录失败：{last_error or '未知错误'}")
+        self._on_login_invalid()
 
     def _refresh_user_identity(self) -> None:
         """缓存 App 登录账号与用户 ID。"""
@@ -215,7 +292,7 @@ class Bridge:
 
     # ── js_api ───────────────────────────────────────────────────────
     def bootstrap(self) -> dict[str, Any]:
-        """初始化：创建配置并尝试恢复上次的 App 登录会话。
+        """初始化：恢复上次会话，失败时自动登录上次账号。
 
         登录只能通过账号密码取得 App Token；旧版本网页与扫码会话会被清除。
         """
@@ -225,14 +302,21 @@ class Bridge:
             self._store.ensure_exists()
             self._store.clear_legacy_login()
             if self._api.app_authenticated:
-                message = self._refresh_courses()
-            elif saved_credentials is not None:
+                try:
+                    message = self._refresh_courses()
+                except (AuthError, AppApiError) as exc:
+                    message = str(exc)
+                if message:
+                    self._clear_login_state()
+            if not self._logged_in and saved_credentials is not None:
                 login_result = self.login_by_password(
                     saved_credentials.account,
                     saved_credentials.password,
                 )
                 if not login_result["ok"]:
                     message = str(login_result["message"])
+                else:
+                    message = f"已自动登录账号 {saved_credentials.account}"
         except AuthError as exc:
             self._clear_login_state()
             message = f"{exc} 请重新登录。"
@@ -351,22 +435,26 @@ class Bridge:
     def start_watching(self) -> dict[str, Any]:
         """启动监控。"""
         try:
+            self._watching_requested = True
             if not self._api.app_authenticated:
-                self._on_login_invalid()
+                self._schedule_session_recovery()
                 return {
-                    "ok": False,
-                    "message": "登录状态失效，请重新登录账号",
+                    "ok": True,
+                    "message": "登录状态失效，正在自动恢复并继续监听",
                 }
             if self._course is None or self._course.course_id == "0":
+                self._watching_requested = False
                 return {"ok": False, "message": "课程未正确加载，请重新登录"}
             self._watcher.start()
             return {"ok": True, "message": f"正在监听【{self._course.name}】"}
         except Exception as exc:  # noqa: BLE001
+            self._watching_requested = False
             return {"ok": False, "message": f"启动监听失败：{exc!s}"}
 
     def stop_watching(self) -> dict[str, Any]:
         """停止监控。"""
         try:
+            self._watching_requested = False
             self._watcher.stop()
             return {"ok": True, "message": "已停止监听"}
         except Exception as exc:  # noqa: BLE001
@@ -389,6 +477,7 @@ class Bridge:
     def window_close(self) -> dict[str, Any]:
         """关闭窗口并停止监控线程。"""
         try:
+            self._watching_requested = False
             self._watcher.stop()
             self._session_keeper.stop()
             if self._window is not None:
@@ -401,7 +490,7 @@ class Bridge:
         """返回当前运行状态，供前端刷新指标。"""
         try:
             if self._logged_in and not self._api.app_authenticated:
-                self._on_login_invalid()
+                self._schedule_session_recovery()
             notice = self._pending_notice
             self._pending_notice = None
             return {

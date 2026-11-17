@@ -6,6 +6,7 @@ import random
 import threading
 import time
 from datetime import datetime
+from typing import Callable
 
 from .api import DuifeneApi
 from .app_api import AppCheckIn, CHINA_TZ, parse_checkin_time
@@ -28,11 +29,13 @@ class Watcher:
         api: DuifeneApi,
         processor: ActivityProcessor,
         log: LogFn,
+        on_auth_lost: Callable[[], None] | None = None,
     ) -> None:
         self._settings = settings
         self._api = api
         self._processor = processor
         self._log = log
+        self._on_auth_lost = on_auth_lost
         self._course: Course | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -134,6 +137,8 @@ class Watcher:
                     course = self._course
                 self._log(self._course_prefix(course, f"{exc!s}，监听已停止"))
                 self._stop.set()
+                if self._on_auth_lost is not None:
+                    self._on_auth_lost()
                 break
             except (PermissionDenied, WebSessionError) as exc:
                 with self._lock:

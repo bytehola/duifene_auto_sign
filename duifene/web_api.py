@@ -67,12 +67,19 @@ class StudentWebApi:
             self._logged_in = False
             self._session.cookies.clear()
 
-    def _request(self, method: str, path: str, **kwargs) -> requests.Response:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        timeout_s: float | None = None,
+        **kwargs,
+    ) -> requests.Response:
         self._session.verify = self._settings.verify_tls
         self._session.proxies = self._settings.proxies or {}
         try:
             return self._session.request(method, WEB_HOST + path, allow_redirects=False,
-                                         timeout=self._settings.request_timeout_s, **kwargs)
+                                         timeout=timeout_s or self._settings.request_timeout_s,
+                                         **kwargs)
         except requests.RequestException as exc:
             raise AppApiError("学生网页签到材料查询网络失败") from exc
 
@@ -81,13 +88,18 @@ class StudentWebApi:
         if credentials is None:
             raise WebSessionError("缺少当前学生账号的网页登录凭据，请重新登录学生账号")
         self.clear()
-        first = self._request("GET", "/Home.aspx")
+        first = self._request(
+            "GET",
+            "/Home.aspx",
+            timeout_s=self._settings.login_timeout_s,
+        )
         if first.status_code != 200:
             raise AppApiError(f"学生网页登录入口请求失败（HTTP {first.status_code}）")
         result = self._request("POST", "/AppCode/LoginInfo.ashx",
                                data={"action": "loginmb", "loginname": credentials.account,
                                      "password": credentials.password},
-                               headers={"Referer": WEB_HOST + "/AppGate.aspx"})
+                               headers={"Referer": WEB_HOST + "/AppGate.aspx"},
+                               timeout_s=self._settings.login_timeout_s)
         try:
             payload = result.json()
         except ValueError as exc:
@@ -174,6 +186,71 @@ class StudentWebApi:
                     if attempt:
                         raise WebSessionError("学生网页会话无法恢复，请重新登录学生账号") from None
         raise WebSessionError("学生网页会话无法恢复，请重新登录学生账号")
+
+    def _switch_role(
+        self,
+        target_message: str,
+        toggled_message: str,
+        failure_message: str,
+    ) -> str:
+        """反复调用身份切换，直到当前网页会话到达目标身份。"""
+        with self._lock:
+            for attempt in range(3):
+                if not self._logged_in:
+                    self._login()
+                response = self._request(
+                    "POST",
+                    "/AppCode/LoginInfo.ashx",
+                    data={"Action": "changetype"},
+                    headers={"Referer": WEB_HOST + "/_UserCenter/PC/CenterStudent.aspx"},
+                    timeout_s=self._settings.login_timeout_s,
+                )
+                if response.status_code in (301, 302, 303, 307, 308, 401):
+                    self.clear()
+                    continue
+                if response.status_code != 200:
+                    raise AppApiError(
+                        f"切换学生身份失败（HTTP {response.status_code}）"
+                    )
+                try:
+                    payload = response.json()
+                except ValueError as exc:
+                    if "topLogin_tbLoginName" in response.text:
+                        self.clear()
+                        continue
+                    raise WebSessionError(
+                        f"{failure_message}，返回了无法解析的数据"
+                    ) from exc
+                if not isinstance(payload, dict):
+                    raise WebSessionError(f"{failure_message}，返回了无效数据")
+                message = str(
+                    payload.get("msgbox") or payload.get("message") or ""
+                )
+                if message == target_message:
+                    return message
+                if message == toggled_message:
+                    continue
+                if "登录" in message:
+                    self.clear()
+                    continue
+                raise WebSessionError(message or failure_message)
+        raise WebSessionError(f"{failure_message}，请重新登录账号")
+
+    def switch_to_student(self) -> str:
+        """把当前网页会话切换为学生身份。"""
+        return self._switch_role(
+            "切换为学生身份",
+            "切换为教师身份",
+            "无法切换到学生身份",
+        )
+
+    def switch_to_teacher(self) -> str:
+        """把当前网页会话切换为教师身份。"""
+        return self._switch_role(
+            "切换为教师身份",
+            "切换为学生身份",
+            "无法切换到教师身份",
+        )
 
     def fetch_token(self, course_id: str) -> str:
         return self._with_login(lambda: self._image(course_id))

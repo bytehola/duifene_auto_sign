@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from typing import Callable
 
 from .api import DuifeneApi
 from .errors import AppApiError, AuthError, LogFn
@@ -17,9 +18,11 @@ class SessionKeeper:
         self,
         api: DuifeneApi,
         log: LogFn,
+        on_auth_lost: Callable[[], None] | None = None,
     ) -> None:
         self._api = api
         self._log = log
+        self._on_auth_lost = on_auth_lost
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
@@ -66,6 +69,8 @@ class SessionKeeper:
             except AuthError as exc:
                 self._log(f"{exc!s}，后台续期已停止")
                 self._stop.set()
+                if self._on_auth_lost is not None:
+                    self._on_auth_lost()
                 break
             except AppApiError as exc:
                 message = str(exc)

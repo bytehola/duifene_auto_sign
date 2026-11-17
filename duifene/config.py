@@ -9,6 +9,7 @@ from typing import Any, Mapping
 SETTINGS_SECTION = "SETTINGS"
 APP_SESSION_SECTION = "APP_SESSION"
 ACCOUNT_SECTION = "ACCOUNT"
+ROOM_COORDINATES_SECTION = "ROOM_COORDINATES"
 
 
 class IniStore:
@@ -112,6 +113,61 @@ class IniStore:
         if not parser.has_section(ACCOUNT_SECTION):
             return
         parser.remove_section(ACCOUNT_SECTION)
+        try:
+            with open(self._path, "w", encoding="utf-8") as handle:
+                parser.write(handle)
+            os.chmod(self._path, 0o600)
+        except OSError:
+            pass
+
+    def load_room_coordinates(self) -> dict[str, tuple[float, float]]:
+        """读取已持久化的教室经纬度。"""
+        parser = configparser.ConfigParser()
+        parser.read(self._path, encoding="utf-8")
+        if not parser.has_section(ROOM_COORDINATES_SECTION):
+            return {}
+        coordinates: dict[str, tuple[float, float]] = {}
+        for room_id, raw_value in parser.items(ROOM_COORDINATES_SECTION):
+            if not room_id.isdecimal() or room_id == "0":
+                continue
+            parts = [part.strip() for part in raw_value.split(",")]
+            if len(parts) != 2:
+                continue
+            try:
+                longitude = float(parts[0])
+                latitude = float(parts[1])
+            except ValueError:
+                continue
+            if not (-180 <= longitude <= 180 and -90 <= latitude <= 90):
+                continue
+            if longitude == 0 and latitude == 0:
+                continue
+            coordinates[room_id] = (longitude, latitude)
+        return coordinates
+
+    def save_room_coordinate(
+        self,
+        room_id: str,
+        longitude: float,
+        latitude: float,
+    ) -> None:
+        """保存一个教室的经纬度，并尽量限制配置文件权限。"""
+        room_id = str(room_id).strip()
+        if not room_id.isdecimal() or room_id == "0":
+            return
+        if not (-180 <= longitude <= 180 and -90 <= latitude <= 90):
+            return
+        if longitude == 0 and latitude == 0:
+            return
+        parser = configparser.ConfigParser()
+        parser.read(self._path, encoding="utf-8")
+        if not parser.has_section(ROOM_COORDINATES_SECTION):
+            parser.add_section(ROOM_COORDINATES_SECTION)
+        parser.set(
+            ROOM_COORDINATES_SECTION,
+            room_id,
+            f"{longitude:.7f},{latitude:.7f}",
+        )
         try:
             with open(self._path, "w", encoding="utf-8") as handle:
                 parser.write(handle)

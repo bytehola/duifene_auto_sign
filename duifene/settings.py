@@ -99,6 +99,7 @@ class Settings:
     proxy_url: str = ""
     verify_tls: bool = True
     request_timeout_s: float = 10.0
+    login_timeout_s: float = 60.0
 
     poll_min_s: float = 3.0
     poll_max_s: float = 5.0
