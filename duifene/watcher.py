@@ -240,7 +240,7 @@ class Watcher:
         self._set_pending_numeric(keep)
 
     def _tick(self) -> None:
-        """从当前学生的记录发现活动，交给处理器。"""
+        """从当前学生的网页签到记录发现活动，交给处理器。"""
         self._last_tick_ts = time.time()
         if self._stop.is_set():
             return

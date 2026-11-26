@@ -1,21 +1,24 @@
-"""学生签到门面：从个人记录发现候选活动，再读取活动详情。"""
+"""学生签到门面：从网页个人记录发现候选活动，再读取 App 活动详情。"""
 
 from __future__ import annotations
 
 import threading
 from dataclasses import replace
 from datetime import datetime
+from typing import Callable, Mapping, TypeVar
 
 import requests
 
 from .app_api import AppCheckIn, AppIdentity, DfAppApi, parse_checkin_time, CHINA_TZ
 from .config import IniStore
 from .credentials import CredentialStore, SavedCredentials
-from .errors import AppApiError, PermissionDenied, RateLimited
+from .errors import AppApiError, AuthError, PermissionDenied, RateLimited
 from .models import Course
 from .rate_limit import RateLimiter
 from .settings import Settings
 from .web_api import StudentWebApi
+
+T = TypeVar("T")
 
 
 class DuifeneApi:
@@ -38,7 +41,6 @@ class DuifeneApi:
         self._login_credentials: SavedCredentials | None = None
         self._student_web = StudentWebApi(settings, self._web_credentials)
         self._app_api.set_reauth_callback(self._relogin_with_saved_credentials)
-        self._teacher_material_cache: dict[str, AppCheckIn] = {}
         self._room_coordinate_cache = self._load_persisted_room_coordinates()
 
     def _load_persisted_room_coordinates(self) -> dict[str, tuple[float, float]]:
@@ -83,6 +85,14 @@ class DuifeneApi:
             credentials = self._credentials.load()
         return credentials if credentials is not None and credentials.account == identity.account else None
 
+    def _run_web_as_teacher(self, operation: Callable[[], T]) -> T:
+        """临时切换网页教师身份执行材料读取，随后恢复学生身份。"""
+        self._student_web.switch_to_teacher()
+        try:
+            return operation()
+        finally:
+            self._student_web.switch_to_student()
+
     @property
     def app_authenticated(self) -> bool:
         """当前是否持有完整 App 登录态。"""
@@ -105,7 +115,6 @@ class DuifeneApi:
             self._student_web.clear()
             self._login_credentials = None
             self._known_courses.clear()
-            self._teacher_material_cache.clear()
             self._room_coordinate_cache.clear()
             self._room_coordinate_cache = self._load_persisted_room_coordinates()
 
@@ -119,7 +128,6 @@ class DuifeneApi:
             self._known_courses.clear()
             self._student_web.clear()
             self._login_credentials = None
-            self._teacher_material_cache.clear()
             self._room_coordinate_cache.clear()
             self._room_coordinate_cache = self._load_persisted_room_coordinates()
             if not self._app_api.login(username, password):
@@ -184,35 +192,29 @@ class DuifeneApi:
                 raise PermissionDenied("监听需要当前学生身份，请登录学生账号")
             if (course.course_id, course.class_id) not in self._known_courses:
                 raise PermissionDenied("所选课程不属于当前学生账号已加载的教学班")
-            teacher_activity = None
-            if identity.user_type_id == "1":
-                teacher_activity = self._app_api.fetch_active_checkin(
-                    course.course_id
-                )
-                if (teacher_activity is not None
-                        and teacher_activity.class_id != course.class_id):
-                    teacher_activity = None
-            records = self._app_api.fetch_student_records(course.class_id)
+            records = self._student_web.fetch_student_log_by_day(
+                course.class_id,
+                identity.user_id,
+            )
             candidates = {}
             for row in records:
                 if str(row.get("CheckInStatus")) == "1" or str(row.get("StatusID")) == "1":
                     continue
+                row_student_id = str(row.get("StudentID") or "")
+                if row_student_id and row_student_id != identity.user_id:
+                    raise PermissionDenied(
+                        "网页签到记录的学生身份不匹配，已停止处理"
+                    )
                 try:
                     age = (datetime.now(CHINA_TZ) - parse_checkin_time(str(row.get("CreaterDate") or ""))).total_seconds()
                 except ValueError as exc:
-                    raise AppApiError("学生签到记录创建时间异常，未处理该轮活动") from exc
+                    raise AppApiError("网页签到记录创建时间异常，未处理该轮活动") from exc
                 # 保留现有“旧活动”配置；负年龄不当作新活动提交。
                 if age < 0 or age > self._settings.stale_sign_minutes * 60:
                     continue
                 candidates[str(row["ID"])] = row
             if not candidates:
                 return []
-            if (identity.user_type_id == "2"
-                    and identity.final_user_type_id == "3"):
-                self._cache_teacher_materials(
-                    course,
-                    set(candidates),
-                )
             activities = []
             for activity_id, student in candidates.items():
                 activity = self._app_api.fetch_checkin(activity_id)
@@ -224,32 +226,6 @@ class DuifeneApi:
                     status_id=str(student.get("StatusID") or ""),
                     status_name=str(student.get("StatusName") or ""),
                 )
-                if (teacher_activity is not None
-                        and teacher_activity.activity_id == activity_id):
-                    activity = replace(
-                        activity,
-                        code=teacher_activity.code or activity.code,
-                        qr_token=teacher_activity.qr_token or activity.qr_token,
-                        room_id=teacher_activity.room_id or activity.room_id,
-                        create_date=teacher_activity.create_date or activity.create_date,
-                        valid_date=teacher_activity.valid_date or activity.valid_date,
-                        is_deleted=teacher_activity.is_deleted,
-                    )
-                cached_material = self._teacher_material_cache.get(activity_id)
-                if cached_material is not None:
-                    activity = replace(
-                        activity,
-                        code=cached_material.code or activity.code,
-                        qr_token=cached_material.qr_token or activity.qr_token,
-                        room_id=cached_material.room_id or activity.room_id,
-                        create_date=(
-                            cached_material.create_date or activity.create_date
-                        ),
-                        valid_date=(
-                            cached_material.valid_date or activity.valid_date
-                        ),
-                        is_deleted=cached_material.is_deleted,
-                    )
                 if activity.activity_id != activity_id or activity.class_id != course.class_id:
                     raise PermissionDenied("签到详情的活动或教学班归属不匹配，已停止处理")
                 if not activity.has_valid_times:
@@ -265,7 +241,7 @@ class DuifeneApi:
             if len(activities) == 1 and len(classes) == 1:
                 activity = activities[0]
                 if activity.check_type == "2" and not activity.qr_token:
-                    token = self._student_web.fetch_token(course.course_id)
+                    token = self._fetch_qr_token(course.course_id)
                     if token:
                         fresh = self._app_api.fetch_checkin(activity.activity_id)
                         if (fresh is None or fresh.activity_id != activity.activity_id
@@ -277,30 +253,39 @@ class DuifeneApi:
                                                 create_date=fresh.create_date, valid_date=fresh.valid_date)
             return activities
 
-    def _cache_teacher_materials(
-        self,
-        course: Course,
-        activity_ids: set[str],
-    ) -> None:
-        """临时切换网页教师身份读取材料，随后恢复学生身份。"""
-        missing_ids = activity_ids - set(self._teacher_material_cache)
-        if not missing_ids:
-            return
-
-        self._student_web.switch_to_teacher()
+    def _fetch_qr_token(self, course_id: str) -> str:
+        """优先以学生身份读取二维码，权限不足时使用教师身份。"""
         try:
-            activity = self._app_api.fetch_active_checkin(course.course_id)
-            if (activity is not None
-                    and activity.activity_id in missing_ids
-                    and activity.class_id == course.class_id):
-                self._teacher_material_cache[activity.activity_id] = activity
-                if activity.room_id:
-                    self._remember_room_coordinates(
-                        activity.room_id,
-                        self._app_api.fetch_room_coordinates(activity.room_id),
+            return self._student_web.fetch_token(course_id)
+        except PermissionDenied:
+            try:
+                return self._run_web_as_teacher(
+                    lambda: self._student_web.fetch_token(course_id)
+                )
+            except PermissionDenied:
+                return ""
+
+    def _fetch_numeric_materials(
+        self,
+        class_id: str,
+        activity_ids: set[str],
+    ) -> dict[str, Mapping[str, Any]]:
+        """优先以学生身份取码，权限不足时使用教师身份。"""
+        try:
+            return self._student_web.fetch_numeric_materials(
+                class_id,
+                activity_ids,
+            )
+        except PermissionDenied:
+            try:
+                return self._run_web_as_teacher(
+                    lambda: self._student_web.fetch_numeric_materials(
+                        class_id,
+                        activity_ids,
                     )
-        finally:
-            self._student_web.switch_to_student()
+                )
+            except PermissionDenied:
+                return {}
 
     def refresh_numeric_materials(self, course: Course, activities: list[AppCheckIn]) -> list[AppCheckIn]:
         """只刷新已确认活动的数字材料，不重复查询个人记录和 App 详情。"""
@@ -322,7 +307,10 @@ class DuifeneApi:
                 len(a.code) == 4 and a.code.isascii() and a.code.isdigit()
             )}
             if missing_codes:
-                materials = self._student_web.fetch_numeric_materials(course.class_id, missing_codes)
+                materials = self._fetch_numeric_materials(
+                    course.class_id,
+                    missing_codes,
+                )
                 updated = []
                 for activity in activities:
                     row = materials.get(activity.activity_id)
@@ -358,18 +346,37 @@ class DuifeneApi:
         activity: AppCheckIn,
     ) -> tuple[float, float] | None:
         """读取签到绑定教室的坐标。"""
-        room_id = activity.room_id
-        cached = self._room_coordinate_cache.get(room_id)
-        if cached is not None:
-            return cached
-        if not room_id or room_id == "0":
-            detail = self.fetch_checkin(activity.activity_id)
-            room_id = detail.room_id if detail is not None else ""
-        if not room_id or room_id == "0":
-            return None
-        coordinates = self._app_api.fetch_room_coordinates(room_id)
-        self._remember_room_coordinates(room_id, coordinates)
-        return coordinates
+        with self._operation_lock:
+            room_id = activity.room_id
+            cached = self._room_coordinate_cache.get(room_id)
+            if cached is not None:
+                return cached
+            if not room_id or room_id == "0":
+                detail = self.fetch_checkin(activity.activity_id)
+                room_id = detail.room_id if detail is not None else ""
+            if not room_id or room_id == "0":
+                return None
+            try:
+                coordinates = self._app_api.fetch_room_coordinates(room_id)
+            except PermissionDenied:
+                coordinates = self._fetch_room_coordinates_as_teacher(room_id)
+            self._remember_room_coordinates(room_id, coordinates)
+            return coordinates
+
+    def _fetch_room_coordinates_as_teacher(
+        self,
+        room_id: str,
+    ) -> tuple[float, float]:
+        """通过网页切教师身份并重登 App，读取坐标后恢复学生身份。"""
+        self._student_web.switch_to_teacher()
+        try:
+            if not self._relogin_with_saved_credentials():
+                raise AuthError("教师身份重登失败，无法读取教室坐标")
+            return self._app_api.fetch_room_coordinates(room_id)
+        finally:
+            self._student_web.switch_to_student()
+            if not self._relogin_with_saved_credentials():
+                raise AuthError("恢复学生身份登录失败，请重新登录账号")
 
     def sign_by_code(self, code: str) -> str:
         """提交签到码或汉字答案。"""

@@ -1,6 +1,6 @@
 """对分易 App REST 接口封装。
 
-账号登录、课程读取、用户信息、学生个人记录、活动详情、
+账号登录、课程读取、用户信息、活动详情、
 教室坐标和四类签到提交都使用 App 接口。
 """
 
@@ -287,38 +287,6 @@ class DfAppApi:
             return AppCheckIn.from_payload(data)
         except ValueError:
             return None
-
-    def fetch_student_records(self, class_id: str) -> list[Mapping[str, Any]]:
-        """读取当前学生自己的考勤记录；不接受外部传入的学生身份。"""
-        identity = self._require_identity()
-        payload = self._request(
-            "GET", f"/CK/GetStudentInLogList/{quote(class_id, safe='')}/"
-            f"{quote(identity.user_id, safe='')}",
-        )
-        self._require_success(payload, "读取学生签到记录失败")
-        rows = payload.get("data")
-        if not isinstance(rows, list):
-            raise AppApiError("学生签到记录列表格式异常")
-        normalized = []
-        for row in rows:
-            if not isinstance(row, Mapping):
-                raise AppApiError("学生签到记录格式异常")
-            # 当前用户专属列表实测在缺勤、签到成功后均可能返回 StudentID=null。
-            # 仅归一化已观察到的自洽状态；非空的其他学生身份仍拒绝。
-            known_self_status = (
-                (str(row.get("StatusID")) == "2"
-                 and not row.get("CheckInStatus") and not row.get("CheckInDate"))
-                or (str(row.get("StatusID")) == "1"
-                    and str(row.get("CheckInStatus")) == "1" and bool(row.get("CheckInDate")))
-            )
-            null_self_id = "StudentID" in row and row["StudentID"] is None and known_self_status
-            if str(row.get("StudentID") or "") != identity.user_id and not null_self_id:
-                raise PermissionDenied("学生签到记录的身份归属不匹配，已停止处理")
-            activity_id = str(row.get("ID") or "")
-            if not activity_id.isdecimal() or int(activity_id) <= 0:
-                raise AppApiError("学生签到记录的活动标识无效")
-            normalized.append({**row, "StudentID": identity.user_id})
-        return normalized
 
     def fetch_checkin(self, activity_id: str) -> AppCheckIn | None:
         """按活动 ID 读取签到详情。"""

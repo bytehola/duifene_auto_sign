@@ -1,4 +1,4 @@
-"""用当前学生的独立网页会话读取签到材料，不读取教师会话。"""
+"""用独立网页会话发现签到并读取材料，身份切换由上层显式控制。"""
 
 from __future__ import annotations
 
@@ -60,11 +60,13 @@ class StudentWebApi:
         self._session = session if session is not None else requests.Session()
         self._session.trust_env = False
         self._logged_in = False
+        self._role = ""
         self._lock = threading.RLock()
 
     def clear(self) -> None:
         with self._lock:
             self._logged_in = False
+            self._role = ""
             self._session.cookies.clear()
 
     def _request(
@@ -81,20 +83,13 @@ class StudentWebApi:
                                          timeout=timeout_s or self._settings.request_timeout_s,
                                          **kwargs)
         except requests.RequestException as exc:
-            raise AppApiError("学生网页签到材料查询网络失败") from exc
+            raise AppApiError("学生网页请求网络失败") from exc
 
     def _login(self) -> None:
         credentials = self._credentials()
         if credentials is None:
             raise WebSessionError("缺少当前学生账号的网页登录凭据，请重新登录学生账号")
         self.clear()
-        first = self._request(
-            "GET",
-            "/Home.aspx",
-            timeout_s=self._settings.login_timeout_s,
-        )
-        if first.status_code != 200:
-            raise AppApiError(f"学生网页登录入口请求失败（HTTP {first.status_code}）")
         result = self._request("POST", "/AppCode/LoginInfo.ashx",
                                data={"action": "loginmb", "loginname": credentials.account,
                                      "password": credentials.password},
@@ -107,6 +102,7 @@ class StudentWebApi:
         if result.status_code != 200 or not isinstance(payload, dict) or payload.get("msgbox") != "登录成功":
             raise WebSessionError("学生网页登录失败，请检查保存的凭据或重新登录学生账号")
         self._logged_in = True
+        self._role = "student"
 
     def _image(self, course_id: str) -> str:
         result = self._request("POST", "/_CheckIn/CheckIn.ashx",
@@ -174,6 +170,65 @@ class StudentWebApi:
                 matches[activity_id] = row
         return matches
 
+    def _student_log_by_day(
+        self,
+        class_id: str,
+        student_id: str,
+    ) -> list[Mapping[str, Any]]:
+        """读取学生当日签到记录，仅用于发现活动 ID。"""
+        if self._role != "student":
+            self.switch_to_student()
+        result = self._request(
+            "POST",
+            "/_CheckIn/MBCount.ashx",
+            data={
+                "action": "getstudentinlogbyday",
+                "classid": class_id,
+                "studentid": student_id,
+            },
+            headers={
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": WEB_HOST + "/_CheckIn/PC/StudentNoCheckCount.aspx",
+            },
+        )
+        if result.status_code in (301, 302, 303, 307, 308, 401):
+            raise _Expired()
+        if result.status_code == 403:
+            raise PermissionDenied("当前学生账号无权读取签到记录（403）")
+        if result.status_code != 200:
+            raise AppApiError(f"网页签到记录请求失败（HTTP {result.status_code}）")
+        try:
+            payload = result.json()
+        except ValueError as exc:
+            if "topLogin_tbLoginName" in result.text:
+                raise _Expired() from exc
+            raise AppApiError("网页签到记录返回了无法解析的数据") from exc
+        if not isinstance(payload, dict):
+            raise AppApiError("网页签到记录格式异常")
+        message = str(payload.get("msgbox") or payload.get("message") or "")
+        if str(payload.get("code")) == "403" or "权限" in message:
+            raise PermissionDenied("当前学生账号无权读取签到记录（403）")
+        if "登录" in message:
+            raise _Expired()
+        if str(payload.get("msg")) != "1":
+            raise AppApiError(message or "网页签到记录读取失败")
+        rows = payload.get("rows")
+        if not isinstance(rows, list):
+            raise AppApiError("网页签到记录未返回列表")
+
+        normalized_rows = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise AppApiError("网页签到记录条目格式异常")
+            row_student_id = str(row.get("StudentID") or "")
+            if row_student_id and row_student_id != student_id:
+                raise PermissionDenied("网页签到记录的学生身份不匹配，未处理")
+            activity_id = str(row.get("ID") or "")
+            if not activity_id.isdecimal() or int(activity_id) <= 0:
+                raise AppApiError("网页签到记录的活动标识无效")
+            normalized_rows.append({**row, "StudentID": student_id})
+        return normalized_rows
+
     def _with_login(self, operation: Callable[[], T]) -> T:
         with self._lock:
             for attempt in range(2):
@@ -189,6 +244,7 @@ class StudentWebApi:
 
     def _switch_role(
         self,
+        target_role: str,
         target_message: str,
         toggled_message: str,
         failure_message: str,
@@ -227,6 +283,7 @@ class StudentWebApi:
                     payload.get("msgbox") or payload.get("message") or ""
                 )
                 if message == target_message:
+                    self._role = target_role
                     return message
                 if message == toggled_message:
                     continue
@@ -239,6 +296,7 @@ class StudentWebApi:
     def switch_to_student(self) -> str:
         """把当前网页会话切换为学生身份。"""
         return self._switch_role(
+            "student",
             "切换为学生身份",
             "切换为教师身份",
             "无法切换到学生身份",
@@ -247,6 +305,7 @@ class StudentWebApi:
     def switch_to_teacher(self) -> str:
         """把当前网页会话切换为教师身份。"""
         return self._switch_role(
+            "teacher",
             "切换为教师身份",
             "切换为学生身份",
             "无法切换到教师身份",
@@ -259,3 +318,15 @@ class StudentWebApi:
         if not activity_ids:
             return {}
         return self._with_login(lambda: self._numeric_materials(class_id, activity_ids))
+
+    def fetch_student_log_by_day(
+        self,
+        class_id: str,
+        student_id: str,
+    ) -> list[Mapping[str, Any]]:
+        """读取学生当日签到记录，供活动监听层使用。"""
+        if not class_id or not student_id:
+            return []
+        return self._with_login(
+            lambda: self._student_log_by_day(class_id, student_id)
+        )

@@ -1,4 +1,4 @@
-# 🎓 对分易自动签到 v3.0
+# 🎓 对分易自动签到 v3.1
 
 ![Python](https://img.shields.io/badge/Python-3.12+-blue?logo=python&logoColor=white)
 ![pywebview](https://img.shields.io/badge/pywebview-%3E%3D5.0-green?logo=web&logoColor=white)
